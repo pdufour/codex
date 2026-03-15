@@ -16,6 +16,7 @@ use cpal::traits::HostTrait;
 use cpal::traits::StreamTrait;
 use hf_hub::api::tokio::Api as HfHubApi;
 use hound::SampleFormat;
+use hound::WavReader;
 use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
@@ -30,18 +31,21 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::trace;
 use transcribe_rs::SpeechModel;
 use transcribe_rs::onnx::Quantization;
 use transcribe_rs::onnx::parakeet::ParakeetModel;
 
-const MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
+const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
+/// Sample rate expected by local models (e.g. Parakeet). Pipeline stays at 24k; we resample to this for local only.
+const LOCAL_MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
 pub(crate) const PARAKEET_REPO_ID: &str = "smcleod/parakeet-tdt-0.6b-v3-int8";
 const ALLOWED_LOCAL_VOICE_REPO_IDS: &[&str] = &[PARAKEET_REPO_ID];
 
-fn allowed_voice_models() -> String {
+pub(crate) fn allowed_voice_models() -> String {
     std::iter::once(TRANSCRIPTION_MODEL_OPENAI)
         .chain(ALLOWED_LOCAL_VOICE_REPO_IDS.iter().copied())
         .collect::<Vec<_>>()
@@ -78,7 +82,10 @@ pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> 
 
 fn resolve_transcription_model_selection() -> Result<String, String> {
     selected_transcription_model().ok_or_else(|| {
-        format!("Select transcription model with /voicemodel. Allowed values: {}.", allowed_voice_models())
+        format!(
+            "Select transcription model with /voicemodel. Allowed values: {}.",
+            allowed_voice_models()
+        )
     })
 }
 
@@ -730,6 +737,40 @@ fn convert_pcm16(
 // Transcription helpers
 // -------------------------
 
+/// Resamples WAV from pipeline rate (24k) to local model rate (16k). No-op if already 16k mono.
+fn resample_wav_for_local_model(wav_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let reader = WavReader::new(Cursor::new(wav_bytes)).map_err(|e| format!("wav: {e}"))?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader
+        .into_samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("wav: {e}"))?;
+    if spec.sample_rate == LOCAL_MODEL_AUDIO_SAMPLE_RATE && spec.channels == 1 {
+        return Ok(wav_bytes.to_vec());
+    }
+    let resampled = convert_pcm16(
+        &samples,
+        spec.sample_rate,
+        spec.channels,
+        LOCAL_MODEL_AUDIO_SAMPLE_RATE,
+        1,
+    );
+    let mut out = Vec::new();
+    let spec_out = WavSpec {
+        channels: 1,
+        sample_rate: LOCAL_MODEL_AUDIO_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(&mut out);
+    let mut writer = WavWriter::new(&mut cursor, spec_out).map_err(|_| "wav".to_string())?;
+    resampled
+        .iter()
+        .try_for_each(|s| writer.write_sample(*s).map_err(|_| "wav".to_string()))?;
+    writer.finalize().map_err(|_| "wav".to_string())?;
+    Ok(out)
+}
+
 fn clip_duration_seconds(audio: &RecordedAudio) -> f32 {
     let total_samples = audio.data.len() as f32;
     let samples_per_second = (audio.sample_rate as f32) * (audio.channels as f32);
@@ -801,6 +842,17 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
     Ok(wav_bytes)
 }
 
+fn normalize_chatgpt_base_url(base_url: &str) -> String {
+    let mut base_url = base_url.trim_end_matches('/').to_string();
+    if (base_url.starts_with("https://chatgpt.com")
+        || base_url.starts_with("https://chat.openai.com"))
+        && !base_url.contains("/backend-api")
+    {
+        base_url = format!("{base_url}/backend-api");
+    }
+    base_url
+}
+
 async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     let codex_home = find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
     let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
@@ -819,7 +871,7 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
         mode: auth.api_auth_mode(),
         bearer_token: token,
         chatgpt_account_id,
-        chatgpt_base_url: config.chatgpt_base_url,
+        chatgpt_base_url: normalize_chatgpt_base_url(&config.chatgpt_base_url),
     })
 }
 
@@ -921,6 +973,9 @@ async fn transcribe_bytes_local(wav_bytes: Vec<u8>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         debug!("transcribe_bytes blocking task started");
 
+        let wav_bytes = resample_wav_for_local_model(&wav_bytes)
+            .map_err(|e| format!("resample for local model: {e}"))?;
+
         let tmp = tempfile::Builder::new()
             .suffix(".wav")
             .tempfile()
@@ -960,12 +1015,15 @@ async fn transcribe_bytes_local(wav_bytes: Vec<u8>) -> Result<String, String> {
 async fn transcribe_bytes_openai(
     wav_bytes: Vec<u8>,
     context: Option<String>,
+    duration_seconds: f32,
 ) -> Result<String, String> {
     let auth = resolve_auth().await?;
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
         .map_err(|error| format!("failed to build transcription HTTP client: {error}"))?;
+    let audio_bytes = wav_bytes.len();
+    let prompt_for_log = context.as_deref().unwrap_or("").to_string();
 
-    let (request, _endpoint) =
+    let (request, endpoint) =
         if matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
             let part = reqwest::multipart::Part::bytes(wav_bytes)
                 .file_name("audio.wav")
@@ -1002,6 +1060,12 @@ async fn transcribe_bytes_openai(
             (req, endpoint)
         };
 
+    let audio_kib = audio_bytes as f32 / 1024.0;
+    let mode = auth.mode;
+    trace!(
+        "sending transcription request: mode={mode:?} endpoint={endpoint} duration={duration_seconds:.2}s audio={audio_kib:.1}KiB prompt={prompt_for_log}"
+    );
+
     let resp = request
         .send()
         .await
@@ -1036,7 +1100,7 @@ async fn transcribe_bytes_openai(
 async fn transcribe_bytes(
     wav_bytes: Vec<u8>,
     context: Option<String>,
-    _: f32,
+    duration_seconds: f32,
 ) -> Result<String, String> {
     debug!(wav_bytes = wav_bytes.len(), "transcribe_bytes start");
     if wav_bytes.is_empty() {
@@ -1047,7 +1111,7 @@ async fn transcribe_bytes(
     let model = resolve_transcription_model_selection()?;
     if model == TRANSCRIPTION_MODEL_OPENAI {
         debug!("transcribe_bytes route: openai");
-        return transcribe_bytes_openai(wav_bytes, context).await;
+        return transcribe_bytes_openai(wav_bytes, context, duration_seconds).await;
     }
 
     debug!(model = %model, "transcribe_bytes route: local");
@@ -1065,12 +1129,12 @@ mod tests {
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {
         let input = vec![100, 300, 200, 400, 500, 700, 600, 800];
-        let converted = convert_pcm16(&input, 48_000, 2, 16_000, 1);
-        assert_eq!(converted, vec![200]);
+        let converted = convert_pcm16(&input, 48_000, 2, 24_000, 1);
+        assert_eq!(converted, vec![200, 700]);
     }
 
     #[test]
-    fn encode_wav_normalized_outputs_16khz_mono_audio() {
+    fn encode_wav_normalized_outputs_24khz_mono_audio() {
         let audio = RecordedAudio {
             data: vec![100, 300, 200, 400, 500, 700, 600, 800],
             sample_rate: 48_000,
@@ -1086,7 +1150,7 @@ mod tests {
             .expect("samples should decode");
 
         assert_eq!(spec.channels, 1);
-        assert_eq!(spec.sample_rate, 16_000);
-        assert_eq!(samples, vec![29_490]);
+        assert_eq!(spec.sample_rate, 24_000);
+        assert_eq!(samples, vec![8_426, 29_490]);
     }
 }
