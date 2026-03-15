@@ -843,7 +843,7 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
 }
 
 fn normalize_chatgpt_base_url(base_url: &str) -> String {
-    let mut base_url = input.to_string();
+    let mut base_url = base_url.to_string();
     while base_url.ends_with('/') {
         base_url.pop();
     }
