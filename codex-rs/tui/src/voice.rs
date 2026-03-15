@@ -843,7 +843,10 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
 }
 
 fn normalize_chatgpt_base_url(base_url: &str) -> String {
-    let mut base_url = base_url.trim_end_matches('/').to_string();
+    let mut base_url = input.to_string();
+    while base_url.ends_with('/') {
+        base_url.pop();
+    }
     if (base_url.starts_with("https://chatgpt.com")
         || base_url.starts_with("https://chat.openai.com"))
         && !base_url.contains("/backend-api")
@@ -1022,8 +1025,7 @@ async fn transcribe_bytes_openai(
         .map_err(|error| format!("failed to build transcription HTTP client: {error}"))?;
     let audio_bytes = wav_bytes.len();
     let prompt_for_log = context.as_deref().unwrap_or("").to_string();
-
-    let (request, endpoint) =
+    let (endpoint, request) =
         if matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
             let part = reqwest::multipart::Part::bytes(wav_bytes)
                 .file_name("audio.wav")
@@ -1039,7 +1041,7 @@ async fn transcribe_bytes_openai(
             if let Some(acc) = auth.chatgpt_account_id {
                 req = req.header("ChatGPT-Account-Id", acc);
             }
-            (req, endpoint)
+            (endpoint, req)
         } else {
             let part = reqwest::multipart::Part::bytes(wav_bytes)
                 .file_name("audio.wav")
@@ -1052,12 +1054,14 @@ async fn transcribe_bytes_openai(
                 form = form.text("prompt", context);
             }
             let endpoint = "https://api.openai.com/v1/audio/transcriptions".to_string();
-            let req = client
-                .post("https://api.openai.com/v1/audio/transcriptions")
-                .bearer_auth(&auth.bearer_token)
-                .multipart(form)
-                .header("User-Agent", get_codex_user_agent());
-            (req, endpoint)
+            (
+                endpoint,
+                client
+                    .post("https://api.openai.com/v1/audio/transcriptions")
+                    .bearer_auth(&auth.bearer_token)
+                    .multipart(form)
+                    .header("User-Agent", get_codex_user_agent()),
+            )
         };
 
     let audio_kib = audio_bytes as f32 / 1024.0;
@@ -1070,6 +1074,7 @@ async fn transcribe_bytes_openai(
         .send()
         .await
         .map_err(|e| format!("transcription request failed: {e}"))?;
+
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp
@@ -1087,7 +1092,6 @@ async fn transcribe_bytes_openai(
         .get("text")
         .and_then(|t| t.as_str())
         .unwrap_or("")
-        .trim()
         .to_string();
 
     if text.is_empty() {
