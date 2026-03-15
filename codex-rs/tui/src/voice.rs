@@ -18,7 +18,6 @@ use hf_hub::api::tokio::Api as HfHubApi;
 use hound::SampleFormat;
 use hound::WavSpec;
 use hound::WavWriter;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -39,8 +38,17 @@ const MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
+pub(crate) const PARAKEET_REPO_ID: &str = "smcleod/parakeet-tdt-0.6b-v3-int8";
+const ALLOWED_LOCAL_VOICE_REPO_IDS: &[&str] = &[PARAKEET_REPO_ID];
+
+fn allowed_voice_models_display() -> String {
+    std::iter::once(TRANSCRIPTION_MODEL_OPENAI)
+        .chain(ALLOWED_LOCAL_VOICE_REPO_IDS.iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 static SELECTED_TRANSCRIPTION_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static LOCAL_MODEL_REPO_ALIASES: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
 
 pub(crate) fn validate_transcription_model_selection() -> Result<(), String> {
     resolve_transcription_model_selection().map(|_| ())
@@ -55,72 +63,34 @@ pub(crate) fn selected_transcription_model() -> Option<String> {
 }
 
 pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> Result<(), String> {
-    let normalized = normalize_selected_model(&model.into())?;
-    let mut guard = SELECTED_TRANSCRIPTION_MODEL
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("selected transcription model lock poisoned");
-    *guard = Some(normalized);
-    Ok(())
-}
-
-fn resolve_transcription_model_selection() -> Result<String, String> {
-    selected_transcription_model()
-        .ok_or_else(|| {
-            format!(
-                "Select transcription model with /voicemodel. Allowed values: {TRANSCRIPTION_MODEL_OPENAI}, {}.",
-                default_local_voice_model_alias()
-            )
-        })
-        .and_then(|model| normalize_selected_model(&model))
-}
-
-fn local_model_repo_aliases() -> &'static HashMap<&'static str, &'static str> {
-    LOCAL_MODEL_REPO_ALIASES.get_or_init(|| {
-        HashMap::from([
-            ("parakeet", "smcleod/parakeet-tdt-0.6b-v3-int8"),
-            (
-                "smcleod/parakeet-tdt-0.6b-v3-int8",
-                "smcleod/parakeet-tdt-0.6b-v3-int8",
-            ),
-        ])
-    })
-}
-
-fn resolve_local_model_alias(alias_or_id: &str) -> Option<&'static str> {
-    let lower = alias_or_id.to_ascii_lowercase();
-    local_model_repo_aliases().get(lower.as_str()).copied()
-}
-
-pub(crate) fn default_local_voice_model_alias() -> &'static str {
-    "parakeet"
-}
-
-pub(crate) fn default_local_voice_model_repo_id() -> &'static str {
-    local_model_repo_aliases()
-        .get(default_local_voice_model_alias())
-        .copied()
-        .unwrap_or("smcleod/parakeet-tdt-0.6b-v3-int8")
-}
-
-fn normalize_selected_model(model: &str) -> Result<String, String> {
+    let model = model.into();
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return Err("Voice model cannot be empty.".to_string());
     }
-    if trimmed.eq_ignore_ascii_case(TRANSCRIPTION_MODEL_OPENAI) {
-        return Ok(TRANSCRIPTION_MODEL_OPENAI.to_string());
+    if trimmed != TRANSCRIPTION_MODEL_OPENAI
+        && !ALLOWED_LOCAL_VOICE_REPO_IDS.iter().any(|id| *id == trimmed)
+    {
+        return Err(format!(
+            "Unsupported voice model '{trimmed}'. Allowed values: {}.",
+            allowed_voice_models_display()
+        ));
     }
+    let mut guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard = Some(trimmed.to_string());
+    Ok(())
+}
 
-    if let Some(repo_id) = resolve_local_model_alias(trimmed) {
-        return Ok(repo_id.to_string());
-    }
-
-    Err(format!(
-        "Unsupported voice model '{trimmed}'. Allowed values: {TRANSCRIPTION_MODEL_OPENAI}, {}, {}",
-        default_local_voice_model_alias(),
-        default_local_voice_model_repo_id()
-    ))
+fn resolve_transcription_model_selection() -> Result<String, String> {
+    selected_transcription_model().ok_or_else(|| {
+        format!(
+            "Select transcription model with /voicemodel. Allowed values: {}.",
+            allowed_voice_models_display()
+        )
+    })
 }
 
 struct TranscriptionAuthContext {
@@ -869,8 +839,7 @@ static MODEL_SLOT: OnceLock<Mutex<Option<(String, ParakeetModel)>>> = OnceLock::
 async fn ensure_model_downloaded(model_id: &str) -> Result<PathBuf, String> {
     let api =
         HfHubApi::new().map_err(|e| format!("failed to initialize Hugging Face Hub API: {e}"))?;
-    let resolved_model_id = resolve_local_model_alias(model_id).unwrap_or(model_id);
-    let repo = api.model(resolved_model_id.to_string());
+    let repo = api.model(model_id.to_string());
     let info = repo
         .info()
         .await
@@ -881,7 +850,7 @@ async fn ensure_model_downloaded(model_id: &str) -> Result<PathBuf, String> {
 
     debug!(
         files = info.siblings.len(),
-        repo = resolved_model_id,
+        repo = model_id,
         "downloading model files via hf-hub"
     );
     let mut sample_downloaded_path: Option<PathBuf> = None;

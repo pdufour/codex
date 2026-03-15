@@ -4679,8 +4679,8 @@ impl ChatWidget {
                     "openai" => {
                         self.set_voice_model(crate::voice::TRANSCRIPTION_MODEL_OPENAI);
                     }
-                    "parakeet" => {
-                        self.set_voice_model(crate::voice::default_local_voice_model_alias());
+                    crate::voice::PARAKEET_REPO_ID => {
+                        self.set_voice_model(crate::voice::PARAKEET_REPO_ID);
                     }
                     "status" => self.show_voice_model_status(),
                     _ => {
@@ -4773,15 +4773,16 @@ impl ChatWidget {
         match crate::voice::selected_transcription_model() {
             Some(value) => self.add_info_message(
                 format!(
-                    "Voice model: {value}. Use /voicemodel openai, /voicemodel parakeet, or /voicemodel <huggingface_model_id>."
+                    "Voice model: {value}. Use /voicemodel openai or /voicemodel {}.",
+                    crate::voice::PARAKEET_REPO_ID
                 ),
                 None,
             ),
             None => self.add_info_message(
                 format!(
-                    "Voice model is not set. Use /voicemodel to pick one ({} / {}), or pass a Hugging Face model id.",
+                    "Voice model is not set. Use /voicemodel to pick one ({} / {}).",
                     crate::voice::TRANSCRIPTION_MODEL_OPENAI,
-                    crate::voice::default_local_voice_model_alias(),
+                    crate::voice::PARAKEET_REPO_ID,
                 ),
                 None,
             ),
@@ -4798,7 +4799,7 @@ impl ChatWidget {
             ),
             (
                 "Parakeet",
-                crate::voice::default_local_voice_model_alias(),
+                crate::voice::PARAKEET_REPO_ID,
                 "Local ONNX model with on-demand file download.",
             ),
         ];
@@ -4810,10 +4811,7 @@ impl ChatWidget {
                 let item_description = if model == crate::voice::TRANSCRIPTION_MODEL_OPENAI {
                     description.to_string()
                 } else {
-                    format!(
-                        "{description} (alias: {model}, repo: {})",
-                        crate::voice::default_local_voice_model_repo_id()
-                    )
+                    format!("{description} (alias: {model})")
                 };
                 let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                     if let Err(error) =
