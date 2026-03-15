@@ -1,7 +1,13 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use base64::Engine;
+use codex_client::build_reqwest_client_with_custom_ca;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
+use codex_core::config::find_codex_home;
+use codex_core::default_client::get_codex_user_agent;
+use codex_login::AuthMode;
+use codex_login::CodexAuth;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeAudioFrame;
@@ -31,6 +37,9 @@ use transcribe_rs::onnx::parakeet::ParakeetModel;
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
 const TRANSCRIBE_DEBUG_LOG: &str = "/tmp/debug.txt";
+const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
+pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
+pub(crate) const TRANSCRIPTION_MODEL_PARAKEET: &str = "models/parakeet-tdt-0.6b-v3-int8";
 const PARAKEET_MODEL_BASE_URL: &str =
     "https://huggingface.co/smcleod/parakeet-tdt-0.6b-v3-int8/resolve/main";
 const PARAKEET_MODEL_FILES: [&str; 4] = [
@@ -39,6 +48,7 @@ const PARAKEET_MODEL_FILES: [&str; 4] = [
     "nemo128.onnx",
     "vocab.txt",
 ];
+static SELECTED_TRANSCRIPTION_MODEL: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
 
 fn append_transcribe_debug_line(message: &str) {
     let mut file = match std::fs::OpenOptions::new()
@@ -50,6 +60,41 @@ fn append_transcribe_debug_line(message: &str) {
         Err(_) => return,
     };
     let _ = writeln!(file, "{message}");
+}
+
+pub(crate) fn validate_transcription_model_selection() -> Result<(), String> {
+    resolve_transcription_model_selection().map(|_| ())
+}
+
+pub(crate) fn selected_transcription_model() -> Option<&'static str> {
+    let guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard
+}
+
+pub(crate) fn set_selected_transcription_model(model: &'static str) {
+    let mut guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard = Some(model);
+}
+
+fn resolve_transcription_model_selection() -> Result<&'static str, String> {
+    selected_transcription_model().ok_or_else(|| {
+        format!(
+            "Select transcription model with /voicemodel. Allowed values: {TRANSCRIPTION_MODEL_OPENAI}, {TRANSCRIPTION_MODEL_PARAKEET}"
+        )
+    })
+}
+
+struct TranscriptionAuthContext {
+    mode: AuthMode,
+    bearer_token: String,
+    chatgpt_account_id: Option<String>,
+    chatgpt_base_url: String,
 }
 
 pub struct RecordedAudio {
@@ -69,6 +114,7 @@ pub struct VoiceCapture {
 
 impl VoiceCapture {
     pub fn start() -> Result<Self, String> {
+        validate_transcription_model_selection()?;
         let (device, config) = select_default_input_device_and_config()?;
 
         let sample_rate = config.sample_rate().0;
@@ -763,12 +809,31 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
     Ok(wav_bytes)
 }
 
+async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
+    let codex_home = find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
+    let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
+        .map_err(|e| format!("failed to read auth.json: {e}"))?
+        .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
+
+    let chatgpt_account_id = auth.get_account_id();
+    let token = auth
+        .get_token()
+        .map_err(|e| format!("failed to get auth token: {e}"))?;
+    let config = Config::load_with_cli_overrides(Vec::new())
+        .await
+        .map_err(|e| format!("failed to load config: {e}"))?;
+
+    Ok(TranscriptionAuthContext {
+        mode: auth.api_auth_mode(),
+        bearer_token: token,
+        chatgpt_account_id,
+        chatgpt_base_url: config.chatgpt_base_url,
+    })
+}
+
 const DEFAULT_MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
 
 fn resolve_model_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("CODEX_TRANSCRIBE_MODEL") {
-        return PathBuf::from(p);
-    }
     let cwd = std::env::current_dir().unwrap_or_default();
     for candidate in [
         cwd.join(DEFAULT_MODEL_DIR),
@@ -805,6 +870,8 @@ async fn ensure_parakeet_model_downloaded(model_dir: &Path) -> Result<(), String
             model_dir.display()
         )
     })?;
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
+        .map_err(|e| format!("failed to build model download HTTP client: {e}"))?;
 
     for file_name in missing_files {
         let url = format!("{PARAKEET_MODEL_BASE_URL}/{file_name}");
@@ -813,35 +880,33 @@ async fn ensure_parakeet_model_downloaded(model_dir: &Path) -> Result<(), String
 
         append_transcribe_debug_line(&format!("downloading model file: {url}"));
 
-        let status = std::process::Command::new("curl")
-            .args([
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--output",
-            ])
-            .arg(&partial)
-            .arg(&url)
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .map_err(|e| format!("failed to execute curl for {file_name}: {e}"))?;
-        if !status.success() {
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("failed to request model file {file_name}: {e}"))?;
+        if !response.status().is_success() {
             return Err(format!(
-                "failed to download model file {file_name}: curl exit {}",
-                status.code().unwrap_or(-1)
+                "failed to download model file {file_name}: http {}",
+                response.status()
             ));
         }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("failed reading model bytes for {file_name}: {e}"))?;
 
-        std::fs::rename(&partial, &target)
+        tokio::fs::write(&partial, &bytes)
+            .await
+            .map_err(|e| format!("failed to write partial model file {file_name}: {e}"))?;
+        tokio::fs::rename(&partial, &target)
+            .await
             .map_err(|e| format!("failed to finalize model file {file_name}: {e}"))?;
-        let file_size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
 
         append_transcribe_debug_line(&format!(
             "downloaded model file: {} ({} bytes)",
             target.display(),
-            file_size
+            bytes.len()
         ));
     }
 
@@ -863,23 +928,19 @@ fn get_or_init_model() -> Result<&'static std::sync::Mutex<ParakeetModel>, Strin
     model_result.as_ref().map_err(Clone::clone)
 }
 
-async fn transcribe_bytes(wav_bytes: Vec<u8>, _: Option<String>, _: f32) -> Result<String, String> {
-    append_transcribe_debug_line(&format!(
-        "transcribe_bytes start: wav_bytes={}",
-        wav_bytes.len()
-    ));
-
-    if wav_bytes.is_empty() {
-        append_transcribe_debug_line("transcribe_bytes error: empty audio buffer");
-        return Err("No audio data".into());
-    }
-
+async fn transcribe_bytes_local(wav_bytes: Vec<u8>) -> Result<String, String> {
     let model_dir = resolve_model_dir();
-    if let Err(e) = ensure_parakeet_model_downloaded(&model_dir).await {
-        append_transcribe_debug_line(&format!(
-            "transcribe_bytes error: model download failed: {e}"
-        ));
-        return Err(e);
+    match resolve_transcription_model_selection() {
+        Ok(TRANSCRIPTION_MODEL_PARAKEET) => {
+            if let Err(e) = ensure_parakeet_model_downloaded(&model_dir).await {
+                append_transcribe_debug_line(&format!(
+                    "transcribe_bytes error: model download failed: {e}"
+                ));
+                return Err(e);
+            }
+        }
+        Ok(other) => return Err(format!("Unsupported transcription model '{other}'.")),
+        Err(e) => return Err(e),
     }
 
     tokio::task::spawn_blocking(move || {
@@ -942,6 +1003,108 @@ async fn transcribe_bytes(wav_bytes: Vec<u8>, _: Option<String>, _: f32) -> Resu
         append_transcribe_debug_line(&format!("transcribe_bytes error: join error: {e}"));
         format!("transcription task join error: {e}")
     })?
+}
+
+async fn transcribe_bytes_openai(
+    wav_bytes: Vec<u8>,
+    context: Option<String>,
+) -> Result<String, String> {
+    let auth = resolve_auth().await?;
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
+        .map_err(|error| format!("failed to build transcription HTTP client: {error}"))?;
+
+    let (request, _endpoint) =
+        if matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
+            let part = reqwest::multipart::Part::bytes(wav_bytes)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| format!("failed to set mime: {e}"))?;
+            let form = reqwest::multipart::Form::new().part("file", part);
+            let endpoint = format!("{}/transcribe", auth.chatgpt_base_url);
+            let mut req = client
+                .post(&endpoint)
+                .bearer_auth(&auth.bearer_token)
+                .multipart(form)
+                .header("User-Agent", get_codex_user_agent());
+            if let Some(acc) = auth.chatgpt_account_id {
+                req = req.header("ChatGPT-Account-Id", acc);
+            }
+            (req, endpoint)
+        } else {
+            let part = reqwest::multipart::Part::bytes(wav_bytes)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| format!("failed to set mime: {e}"))?;
+            let mut form = reqwest::multipart::Form::new()
+                .text("model", AUDIO_MODEL)
+                .part("file", part);
+            if let Some(context) = context {
+                form = form.text("prompt", context);
+            }
+            let endpoint = "https://api.openai.com/v1/audio/transcriptions".to_string();
+            let req = client
+                .post("https://api.openai.com/v1/audio/transcriptions")
+                .bearer_auth(&auth.bearer_token)
+                .multipart(form)
+                .header("User-Agent", get_codex_user_agent());
+            (req, endpoint)
+        };
+
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("transcription request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read body>".to_string());
+        return Err(format!("transcription failed: {status} {body}"));
+    }
+
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse json: {e}"))?;
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if text.is_empty() {
+        Err("empty transcription result".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+async fn transcribe_bytes(
+    wav_bytes: Vec<u8>,
+    context: Option<String>,
+    _: f32,
+) -> Result<String, String> {
+    append_transcribe_debug_line(&format!(
+        "transcribe_bytes start: wav_bytes={}",
+        wav_bytes.len()
+    ));
+    if wav_bytes.is_empty() {
+        append_transcribe_debug_line("transcribe_bytes error: empty audio buffer");
+        return Err("No audio data".into());
+    }
+
+    let model = resolve_transcription_model_selection()?;
+    if model == TRANSCRIPTION_MODEL_OPENAI {
+        append_transcribe_debug_line("transcribe_bytes route: openai (selected model=openai)");
+        return transcribe_bytes_openai(wav_bytes, context).await;
+    }
+
+    append_transcribe_debug_line(&format!(
+        "transcribe_bytes route: local (selected model={model})"
+    ));
+    transcribe_bytes_local(wav_bytes).await
 }
 
 #[cfg(test)]

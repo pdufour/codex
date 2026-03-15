@@ -4358,6 +4358,9 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::VoiceModel => {
+                self.open_voice_model_popup();
+            }
             SlashCommand::Fast => {
                 let next_tier = if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
                     None
@@ -4667,6 +4670,28 @@ impl ChatWidget {
                     }
                 }
             }
+            SlashCommand::VoiceModel => {
+                if trimmed.is_empty() {
+                    self.dispatch_command(cmd);
+                    return;
+                }
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "openai" => {
+                        self.set_voice_model(crate::voice::TRANSCRIPTION_MODEL_OPENAI);
+                    }
+                    "parakeet" | crate::voice::TRANSCRIPTION_MODEL_PARAKEET => {
+                        self.set_voice_model(crate::voice::TRANSCRIPTION_MODEL_PARAKEET);
+                    }
+                    "status" => self.show_voice_model_status(),
+                    _ => {
+                        self.add_error_message(format!(
+                            "Usage: /voicemodel [openai|parakeet|status] (maps to '{}' or '{}')",
+                            crate::voice::TRANSCRIPTION_MODEL_OPENAI,
+                            crate::voice::TRANSCRIPTION_MODEL_PARAKEET,
+                        ));
+                    }
+                }
+            }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.session_telemetry
                     .counter("codex.thread.rename", 1, &[]);
@@ -4746,6 +4771,81 @@ impl ChatWidget {
             }
             _ => self.dispatch_command(cmd),
         }
+    }
+
+    fn show_voice_model_status(&mut self) {
+        match crate::voice::selected_transcription_model() {
+            Some(value) => self.add_info_message(
+                format!(
+                    "Voice model: {value}. Use /voicemodel openai or /voicemodel parakeet to change."
+                ),
+                None,
+            ),
+            None => self.add_info_message(
+                format!(
+                    "Voice model is not set. Use /voicemodel to pick one ({} / {}).",
+                    crate::voice::TRANSCRIPTION_MODEL_OPENAI,
+                    crate::voice::TRANSCRIPTION_MODEL_PARAKEET,
+                ),
+                None,
+            ),
+        }
+    }
+
+    fn open_voice_model_popup(&mut self) {
+        let current_model = crate::voice::selected_transcription_model();
+        let voice_models = [
+            (
+                "OpenAI",
+                crate::voice::TRANSCRIPTION_MODEL_OPENAI,
+                "Use OpenAI hosted transcription.",
+            ),
+            (
+                "Parakeet",
+                crate::voice::TRANSCRIPTION_MODEL_PARAKEET,
+                "Local ONNX model with on-demand file download.",
+            ),
+        ];
+
+        let items: Vec<SelectionItem> = voice_models
+            .into_iter()
+            .map(|(name, model, description)| {
+                let model_for_action = model;
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    crate::voice::set_selected_transcription_model(model_for_action);
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_info_event(
+                            format!("Voice model set to '{model_for_action}'."),
+                            None,
+                        ),
+                    )));
+                })];
+
+                SelectionItem {
+                    name: name.to_string(),
+                    description: Some(format!("{description} ({model})")),
+                    is_current: current_model == Some(model),
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Voice Model".to_string()),
+            subtitle: Some(
+                "Choose the local transcription model used for voice input.".to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    fn set_voice_model(&mut self, model: &'static str) {
+        crate::voice::set_selected_transcription_model(model);
+        self.add_info_message(format!("Voice model set to '{model}'."), None);
     }
 
     fn show_rename_prompt(&mut self) {
