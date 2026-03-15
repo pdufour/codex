@@ -4779,8 +4779,16 @@ impl ChatWidget {
     fn open_voice_model_popup(&mut self) {
         let current_model = crate::voice::selected_transcription_model();
         let voice_models = [
-            ("OpenAI", crate::voice::TRANSCRIPTION_MODEL_OPENAI, "Hosted transcription."),
-            ("Parakeet", crate::voice::PARAKEET_REPO_ID, "Local ONNX, on-demand download."),
+            (
+                "OpenAI",
+                crate::voice::TRANSCRIPTION_MODEL_OPENAI,
+                "Hosted transcription.",
+            ),
+            (
+                "Parakeet",
+                crate::voice::PARAKEET_REPO_ID,
+                "Local ONNX, on-demand download.",
+            ),
         ];
 
         let items: Vec<SelectionItem> = voice_models
@@ -4871,16 +4879,16 @@ impl ChatWidget {
         let tx = self.app_event_tx.clone();
         let model_for_task = model.to_string();
         tokio::spawn(async move {
-            let msg = match crate::voice::prefetch_selected_transcription_model(&model_for_task).await
-            {
-                Ok(()) => history_cell::new_info_event(
-                    format!("Voice model '{model_for_task}' ready."),
-                    None,
-                ),
-                Err(e) => history_cell::new_error_event(format!(
-                    "Download failed for '{model_for_task}': {e}"
-                )),
-            };
+            let msg =
+                match crate::voice::prefetch_selected_transcription_model(&model_for_task).await {
+                    Ok(()) => history_cell::new_info_event(
+                        format!("Voice model '{model_for_task}' ready."),
+                        None,
+                    ),
+                    Err(e) => history_cell::new_error_event(format!(
+                        "Download failed for '{model_for_task}': {e}"
+                    )),
+                };
             tx.send(AppEvent::InsertHistoryCell(Box::new(msg)));
         });
     }
