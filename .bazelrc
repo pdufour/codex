@@ -30,6 +30,12 @@ common --incompatible_strict_action_env
 # Not ideal, but We need to allow dotslash to be found
 common:linux --test_env=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 common:macos --test_env=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+common:macos --action_env=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+common:macos --action_env=HOME
+common:macos --linkopt=-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks
+common:macos --linkopt=-framework
+common:macos --linkopt=CoreML
+common:macos --linkopt=-L/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin
 
 # Pass through some env vars Windows needs to use powershell?
 common:windows --test_env=PATH
@@ -39,8 +45,8 @@ common:windows --test_env=WINDIR
 
 common --test_output=errors
 common --bes_results_url=https://app.buildbuddy.io/invocation/
-common --bes_backend=grpcs://remote.buildbuddy.io
-common --remote_cache=grpcs://remote.buildbuddy.io
+# common --bes_backend=grpcs://remote.buildbuddy.io
+# common --remote_cache=grpcs://remote.buildbuddy.io
 common --remote_download_toplevel
 common --nobuild_runfile_links
 common --remote_timeout=3600
@@ -54,7 +60,7 @@ common --grpc_keepalive_time=30s
 common --jobs=30
 
 common:remote --extra_execution_platforms=//:rbe
-common:remote --remote_executor=grpcs://remote.buildbuddy.io
+# common:remote --remote_executor=grpcs://remote.buildbuddy.io
 common:remote --jobs=800
 # TODO(team): Evaluate if this actually helps, zbarsky is not sure, everything seems bottlenecked on `core` either way.
 # Enable pipelined compilation since we are not bound by local CPU count.

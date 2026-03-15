@@ -1,13 +1,7 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use base64::Engine;
-use codex_client::build_reqwest_client_with_custom_ca;
-use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
-use codex_core::default_client::get_codex_user_agent;
-use codex_login::AuthMode;
-use codex_login::CodexAuth;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeAudioFrame;
@@ -19,24 +13,34 @@ use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 use tracing::error;
 use tracing::info;
-use tracing::trace;
+use transcribe_rs::SpeechModel;
+use transcribe_rs::onnx::Quantization;
+use transcribe_rs::onnx::parakeet::ParakeetModel;
 
-const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
-const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
+const MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
+const TRANSCRIBE_DEBUG_LOG: &str = "/tmp/debug.txt";
 
-struct TranscriptionAuthContext {
-    mode: AuthMode,
-    bearer_token: String,
-    chatgpt_account_id: Option<String>,
-    chatgpt_base_url: String,
+fn append_transcribe_debug_line(message: &str) {
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TRANSCRIBE_DEBUG_LOG)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let _ = writeln!(file, "{message}");
 }
 
 pub struct RecordedAudio {
@@ -750,126 +754,112 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
     Ok(wav_bytes)
 }
 
-fn normalize_chatgpt_base_url(input: &str) -> String {
-    let mut base_url = input.to_string();
-    while base_url.ends_with('/') {
-        base_url.pop();
+const DEFAULT_MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
+
+fn resolve_model_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("CODEX_TRANSCRIBE_MODEL") {
+        return PathBuf::from(p);
     }
-    if (base_url.starts_with("https://chatgpt.com")
-        || base_url.starts_with("https://chat.openai.com"))
-        && !base_url.contains("/backend-api")
-    {
-        base_url = format!("{base_url}/backend-api");
+    let cwd = std::env::current_dir().unwrap_or_default();
+    for candidate in [
+        cwd.join(DEFAULT_MODEL_DIR),
+        cwd.join("codex-rs").join(DEFAULT_MODEL_DIR),
+    ] {
+        if candidate.is_dir() {
+            return candidate;
+        }
     }
-    base_url
+    PathBuf::from(DEFAULT_MODEL_DIR)
 }
 
-async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let codex_home = find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
-    let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
-        .map_err(|e| format!("failed to read auth.json: {e}"))?
-        .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
+static MODEL: OnceLock<Result<std::sync::Mutex<ParakeetModel>, String>> = OnceLock::new();
 
-    let chatgpt_account_id = auth.get_account_id();
-
-    let token = auth
-        .get_token()
-        .map_err(|e| format!("failed to get auth token: {e}"))?;
-    let config = Config::load_with_cli_overrides(Vec::new())
-        .await
-        .map_err(|e| format!("failed to load config: {e}"))?;
-    Ok(TranscriptionAuthContext {
-        mode: auth.api_auth_mode(),
-        bearer_token: token,
-        chatgpt_account_id,
-        chatgpt_base_url: normalize_chatgpt_base_url(&config.chatgpt_base_url),
-    })
-}
-
-async fn transcribe_bytes(
-    wav_bytes: Vec<u8>,
-    context: Option<String>,
-    duration_seconds: f32,
-) -> Result<String, String> {
-    let auth = resolve_auth().await?;
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
-        .map_err(|error| format!("failed to build transcription HTTP client: {error}"))?;
-    let audio_bytes = wav_bytes.len();
-    let prompt_for_log = context.as_deref().unwrap_or("").to_string();
-    let (endpoint, request) =
-        if matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
-            let part = reqwest::multipart::Part::bytes(wav_bytes)
-                .file_name("audio.wav")
-                .mime_str("audio/wav")
-                .map_err(|e| format!("failed to set mime: {e}"))?;
-            let form = reqwest::multipart::Form::new().part("file", part);
-            let endpoint = format!("{}/transcribe", auth.chatgpt_base_url);
-            let mut req = client
-                .post(&endpoint)
-                .bearer_auth(&auth.bearer_token)
-                .multipart(form)
-                .header("User-Agent", get_codex_user_agent());
-            if let Some(acc) = auth.chatgpt_account_id {
-                req = req.header("ChatGPT-Account-Id", acc);
-            }
-            (endpoint, req)
-        } else {
-            let part = reqwest::multipart::Part::bytes(wav_bytes)
-                .file_name("audio.wav")
-                .mime_str("audio/wav")
-                .map_err(|e| format!("failed to set mime: {e}"))?;
-            let mut form = reqwest::multipart::Form::new()
-                .text("model", AUDIO_MODEL)
-                .part("file", part);
-            if let Some(context) = context {
-                form = form.text("prompt", context);
-            }
-            let endpoint = "https://api.openai.com/v1/audio/transcriptions".to_string();
-            (
-                endpoint,
-                client
-                    .post("https://api.openai.com/v1/audio/transcriptions")
-                    .bearer_auth(&auth.bearer_token)
-                    .multipart(form)
-                    .header("User-Agent", get_codex_user_agent()),
+fn get_or_init_model() -> Result<&'static std::sync::Mutex<ParakeetModel>, String> {
+    let model_result = MODEL.get_or_init(|| {
+        let model_dir = resolve_model_dir();
+        info!("loading Parakeet model from {}", model_dir.display());
+        let model = ParakeetModel::load(&model_dir, &Quantization::Int8).map_err(|e| {
+            format!(
+                "failed to load transcription model from {}: {e}",
+                model_dir.display()
             )
+        })?;
+        Ok(std::sync::Mutex::new(model))
+    });
+    model_result.as_ref().map_err(Clone::clone)
+}
+
+async fn transcribe_bytes(wav_bytes: Vec<u8>, _: Option<String>, _: f32) -> Result<String, String> {
+    append_transcribe_debug_line(&format!(
+        "transcribe_bytes start: wav_bytes={}",
+        wav_bytes.len()
+    ));
+
+    if wav_bytes.is_empty() {
+        append_transcribe_debug_line("transcribe_bytes error: empty audio buffer");
+        return Err("No audio data".into());
+    }
+
+    tokio::task::spawn_blocking(move || {
+        append_transcribe_debug_line("transcribe_bytes blocking task started");
+
+        let tmp = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .map_err(|e| format!("failed to create temp file: {e}"))?;
+        let tmp_path = tmp.path().to_path_buf();
+        append_transcribe_debug_line(&format!("temp wav path: {}", tmp_path.display()));
+
+        if let Err(e) = std::fs::write(&tmp_path, &wav_bytes) {
+            append_transcribe_debug_line(&format!(
+                "transcribe_bytes error: failed temp wav write: {e}"
+            ));
+            return Err(format!("failed to write temp wav: {e}"));
+        }
+
+        append_transcribe_debug_line("initializing/parsing parakeet model");
+        let model_mutex = match get_or_init_model() {
+            Ok(model_mutex) => model_mutex,
+            Err(e) => {
+                append_transcribe_debug_line(&format!(
+                    "transcribe_bytes error: model init failed: {e}"
+                ));
+                return Err(e);
+            }
         };
+        append_transcribe_debug_line("model ready; acquiring model lock");
+        let mut model = model_mutex
+            .lock()
+            .map_err(|e| format!("model lock poisoned: {e}"))?;
+        append_transcribe_debug_line("model lock acquired; invoking transcribe_file");
 
-    let audio_kib = audio_bytes as f32 / 1024.0;
-    let mode = auth.mode;
-    trace!(
-        "sending transcription request: mode={mode:?} endpoint={endpoint} duration={duration_seconds:.2}s audio={audio_kib:.1}KiB prompt={prompt_for_log}"
-    );
+        let result =
+            match model.transcribe_file(&tmp_path, &transcribe_rs::TranscribeOptions::default()) {
+                Ok(result) => result,
+                Err(e) => {
+                    append_transcribe_debug_line(&format!(
+                        "transcribe_bytes error: transcribe_file failed: {e}"
+                    ));
+                    return Err(format!("transcription failed: {e}"));
+                }
+            };
 
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("transcription request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_string());
-        return Err(format!("transcription failed: {status} {body}"));
-    }
-
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse json: {e}"))?;
-    let text = v
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if text.is_empty() {
-        Err("empty transcription result".to_string())
-    } else {
-        Ok(text)
-    }
+        let text = result.text.trim().to_string();
+        append_transcribe_debug_line(&format!(
+            "transcribe_bytes success: text_len={}",
+            text.len()
+        ));
+        Ok(if text.is_empty() {
+            "(no speech detected)".to_string()
+        } else {
+            text
+        })
+    })
+    .await
+    .map_err(|e| {
+        append_transcribe_debug_line(&format!("transcribe_bytes error: join error: {e}"));
+        format!("transcription task join error: {e}")
+    })?
 }
 
 #[cfg(test)]
@@ -883,12 +873,12 @@ mod tests {
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {
         let input = vec![100, 300, 200, 400, 500, 700, 600, 800];
-        let converted = convert_pcm16(&input, 48_000, 2, 24_000, 1);
-        assert_eq!(converted, vec![200, 700]);
+        let converted = convert_pcm16(&input, 48_000, 2, 16_000, 1);
+        assert_eq!(converted, vec![200]);
     }
 
     #[test]
-    fn encode_wav_normalized_outputs_24khz_mono_audio() {
+    fn encode_wav_normalized_outputs_16khz_mono_audio() {
         let audio = RecordedAudio {
             data: vec![100, 300, 200, 400, 500, 700, 600, 800],
             sample_rate: 48_000,
@@ -904,7 +894,7 @@ mod tests {
             .expect("samples should decode");
 
         assert_eq!(spec.channels, 1);
-        assert_eq!(spec.sample_rate, 24_000);
-        assert_eq!(samples, vec![8_426, 29_490]);
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(samples, vec![29_490]);
     }
 }
