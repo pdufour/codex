@@ -4778,18 +4778,7 @@ impl ChatWidget {
 
     fn open_voice_model_popup(&mut self) {
         let current_model = crate::voice::selected_transcription_model();
-        let voice_models = [
-            (
-                "OpenAI",
-                crate::voice::TRANSCRIPTION_MODEL_OPENAI,
-                "Hosted transcription.",
-            ),
-            (
-                "Parakeet",
-                crate::voice::PARAKEET_REPO_ID,
-                "Local ONNX, on-demand download.",
-            ),
-        ];
+        let voice_models = crate::voice::voice_model_picker_options();
 
         let items: Vec<SelectionItem> = voice_models
             .into_iter()

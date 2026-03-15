@@ -38,18 +38,65 @@ use transcribe_rs::onnx::parakeet::ParakeetModel;
 
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
-/// Sample rate expected by local models (e.g. Parakeet). Pipeline stays at 24k; we resample to this for local only.
+/// Sample rate expected by local ONNX models. Pipeline stays at 24k; we resample to this for local only.
 const LOCAL_MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
-pub(crate) const PARAKEET_REPO_ID: &str = "smcleod/parakeet-tdt-0.6b-v3-int8";
-const ALLOWED_LOCAL_VOICE_REPO_IDS: &[&str] = &[PARAKEET_REPO_ID];
+
+/// Architecture class of a local transcription model; selects the loader used for a repo.
+#[derive(Clone, Copy)]
+enum LocalVoiceModelClass {
+    Parakeet,
+}
+
+/// One allowed local voice model: repo ID, class (loader), and UI label/description. This is the single list of allowed local models.
+struct AllowedLocalVoiceModel {
+    repo_id: &'static str,
+    class: LocalVoiceModelClass,
+    /// Display name in the voice model picker (e.g. "Parakeet").
+    label: &'static str,
+    /// Short description for the picker (e.g. "Local ONNX, on-demand download.").
+    description: &'static str,
+}
+
+const ALLOWED_LOCAL_VOICE_MODELS: &[AllowedLocalVoiceModel] = &[AllowedLocalVoiceModel {
+    repo_id: "smcleod/parakeet-tdt-0.6b-v3-int8",
+    class: LocalVoiceModelClass::Parakeet,
+    label: "Parakeet",
+    description: "Local ONNX, on-demand download.",
+}];
+
+fn get_class_for_repo(repo_id: &str) -> Option<LocalVoiceModelClass> {
+    ALLOWED_LOCAL_VOICE_MODELS
+        .iter()
+        .find(|m| m.repo_id == repo_id)
+        .map(|m| m.class)
+}
+
+fn allowed_local_voice_repo_ids() -> impl Iterator<Item = &'static str> {
+    ALLOWED_LOCAL_VOICE_MODELS.iter().map(|m| m.repo_id)
+}
 
 pub(crate) fn allowed_voice_models() -> String {
     std::iter::once(TRANSCRIPTION_MODEL_OPENAI)
-        .chain(ALLOWED_LOCAL_VOICE_REPO_IDS.iter().copied())
+        .chain(allowed_local_voice_repo_ids())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Options for the voice model picker: (display label, model id, description).
+pub(crate) fn voice_model_picker_options() -> Vec<(&'static str, &'static str, &'static str)> {
+    std::iter::once((
+        "OpenAI",
+        TRANSCRIPTION_MODEL_OPENAI,
+        "Hosted transcription.",
+    ))
+    .chain(
+        ALLOWED_LOCAL_VOICE_MODELS
+            .iter()
+            .map(|m| (m.label, m.repo_id, m.description)),
+    )
+    .collect()
 }
 
 static SELECTED_TRANSCRIPTION_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -65,7 +112,7 @@ pub(crate) fn selected_transcription_model() -> Option<String> {
 pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> Result<(), String> {
     let trimmed = model.into().trim().to_string();
     if trimmed != TRANSCRIPTION_MODEL_OPENAI
-        && !ALLOWED_LOCAL_VOICE_REPO_IDS.iter().any(|id| *id == trimmed)
+        && !allowed_local_voice_repo_ids().any(|id| id == trimmed)
     {
         return Err(format!(
             "Unsupported voice model '{trimmed}'. Allowed values: {}.",
@@ -878,7 +925,23 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     })
 }
 
-static MODEL_SLOT: OnceLock<Mutex<Option<(String, ParakeetModel)>>> = OnceLock::new();
+static MODEL_SLOT: OnceLock<Mutex<Option<(String, Box<dyn SpeechModel + Send>)>>> = OnceLock::new();
+
+fn load_model_for_class(
+    class: LocalVoiceModelClass,
+    model_dir: &PathBuf,
+) -> Result<Box<dyn SpeechModel + Send>, String> {
+    match class {
+        LocalVoiceModelClass::Parakeet => ParakeetModel::load(model_dir, &Quantization::Int8)
+            .map_err(|e| {
+                format!(
+                    "failed to load transcription model from {}: {e}",
+                    model_dir.display()
+                )
+            })
+            .map(|m| -> Box<dyn SpeechModel + Send> { Box::new(m) }),
+    }
+}
 
 async fn ensure_model_downloaded(model_id: &str) -> Result<PathBuf, String> {
     let api =
@@ -938,13 +1001,13 @@ fn transcribe_file_with_model(
         .as_ref()
         .is_none_or(|(loaded_model_id, _)| loaded_model_id != model_id);
     if needs_reload {
-        info!("loading Parakeet model from {}", model_dir.display());
-        let model = ParakeetModel::load(model_dir, &Quantization::Int8).map_err(|e| {
-            format!(
-                "failed to load transcription model from {}: {e}",
-                model_dir.display()
-            )
-        })?;
+        let class = get_class_for_repo(model_id)
+            .ok_or_else(|| format!("unknown local voice model repo: {model_id}"))?;
+        info!(
+            "loading local transcription model from {}",
+            model_dir.display()
+        );
+        let model = load_model_for_class(class, model_dir)?;
         *slot = Some((model_id.to_string(), model));
     }
     let (_, model) = slot
@@ -991,7 +1054,7 @@ async fn transcribe_bytes_local(wav_bytes: Vec<u8>) -> Result<String, String> {
             return Err(format!("failed to write temp wav: {e}"));
         }
 
-        debug!("initializing/parsing parakeet model");
+        debug!("initializing/parsing local transcription model");
         let result = match transcribe_file_with_model(&model_id, &model_dir, &tmp_path) {
             Ok(result) => result,
             Err(e) => {
