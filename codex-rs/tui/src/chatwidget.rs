@@ -4675,17 +4675,10 @@ impl ChatWidget {
                     self.dispatch_command(cmd);
                     return;
                 }
-                match trimmed.to_ascii_lowercase().as_str() {
-                    "openai" => {
-                        self.set_voice_model(crate::voice::TRANSCRIPTION_MODEL_OPENAI);
-                    }
-                    crate::voice::PARAKEET_REPO_ID => {
-                        self.set_voice_model(crate::voice::PARAKEET_REPO_ID);
-                    }
-                    "status" => self.show_voice_model_status(),
-                    _ => {
-                        self.set_voice_model(trimmed);
-                    }
+                if trimmed.eq_ignore_ascii_case("status") {
+                    self.show_voice_model_status();
+                } else {
+                    self.set_voice_model(trimmed);
                 }
             }
             SlashCommand::Rename if !trimmed.is_empty() => {
@@ -4770,20 +4763,14 @@ impl ChatWidget {
     }
 
     fn show_voice_model_status(&mut self) {
+        let allowed = crate::voice::allowed_voice_models();
         match crate::voice::selected_transcription_model() {
             Some(value) => self.add_info_message(
-                format!(
-                    "Voice model: {value}. Use /voicemodel openai or /voicemodel {}.",
-                    crate::voice::PARAKEET_REPO_ID
-                ),
+                format!("Voice model: {value}. Use /voicemodel with: {allowed}."),
                 None,
             ),
             None => self.add_info_message(
-                format!(
-                    "Voice model is not set. Use /voicemodel to pick one ({} / {}).",
-                    crate::voice::TRANSCRIPTION_MODEL_OPENAI,
-                    crate::voice::PARAKEET_REPO_ID,
-                ),
+                format!("Voice model not set. Use /voicemodel to pick one: {allowed}."),
                 None,
             ),
         }
@@ -4792,34 +4779,22 @@ impl ChatWidget {
     fn open_voice_model_popup(&mut self) {
         let current_model = crate::voice::selected_transcription_model();
         let voice_models = [
-            (
-                "OpenAI",
-                crate::voice::TRANSCRIPTION_MODEL_OPENAI,
-                "Use OpenAI hosted transcription.",
-            ),
-            (
-                "Parakeet",
-                crate::voice::PARAKEET_REPO_ID,
-                "Local ONNX model with on-demand file download.",
-            ),
+            ("OpenAI", crate::voice::TRANSCRIPTION_MODEL_OPENAI, "Hosted transcription."),
+            ("Parakeet", crate::voice::PARAKEET_REPO_ID, "Local ONNX, on-demand download."),
         ];
 
         let items: Vec<SelectionItem> = voice_models
             .into_iter()
             .map(|(name, model, description)| {
                 let model_for_action = model.to_string();
-                let item_description = if model == crate::voice::TRANSCRIPTION_MODEL_OPENAI {
-                    description.to_string()
-                } else {
-                    format!("{description} (alias: {model})")
-                };
+                let is_local = model != crate::voice::TRANSCRIPTION_MODEL_OPENAI;
                 let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                     if let Err(error) =
                         crate::voice::try_set_selected_transcription_model(model_for_action.clone())
                     {
-                        tx.send(AppEvent::InsertHistoryCell(Box::new(history_cell::new_error_event(
-                            error,
-                        ))));
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_error_event(error),
+                        )));
                         return;
                     }
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -4828,40 +4803,37 @@ impl ChatWidget {
                             None,
                         ),
                     )));
-                    if model_for_action != crate::voice::TRANSCRIPTION_MODEL_OPENAI {
-                        tx.send(AppEvent::InsertHistoryCell(Box::new(history_cell::new_info_event(
-                            format!("⏳ Downloading voice model '{model_for_action}'..."),
-                            None,
-                        ))));
+                    if is_local {
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(
+                                format!("⏳ Downloading '{model_for_action}'..."),
+                                None,
+                            ),
+                        )));
                         let tx_clone = tx.clone();
                         let model_for_task = model_for_action.clone();
                         tokio::spawn(async move {
-                            let result = crate::voice::prefetch_selected_transcription_model(
+                            let msg = match crate::voice::prefetch_selected_transcription_model(
                                 &model_for_task,
                             )
-                            .await;
-                            match result {
-                                Ok(()) => tx_clone.send(AppEvent::InsertHistoryCell(Box::new(
-                                    history_cell::new_info_event(
-                                        format!(
-                                            "Voice model '{model_for_task}' is ready for local transcription."
-                                        ),
-                                        None,
-                                    ),
-                                ))),
-                                Err(error) => tx_clone.send(AppEvent::InsertHistoryCell(Box::new(
-                                    history_cell::new_error_event(format!(
-                                        "Failed to download voice model '{model_for_task}': {error}"
-                                    )),
-                                ))),
-                            }
+                            .await
+                            {
+                                Ok(()) => history_cell::new_info_event(
+                                    format!("Voice model '{model_for_task}' ready."),
+                                    None,
+                                ),
+                                Err(e) => history_cell::new_error_event(format!(
+                                    "Download failed for '{model_for_task}': {e}"
+                                )),
+                            };
+                            tx_clone.send(AppEvent::InsertHistoryCell(Box::new(msg)));
                         });
                     }
                 })];
 
                 SelectionItem {
                     name: name.to_string(),
-                    description: Some(item_description),
+                    description: Some(description.to_string()),
                     is_current: current_model.as_deref() == Some(model),
                     actions,
                     dismiss_on_select: true,
@@ -4872,9 +4844,7 @@ impl ChatWidget {
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Select Voice Model".to_string()),
-            subtitle: Some(
-                "Choose the local transcription model used for voice input.".to_string(),
-            ),
+            subtitle: Some("Transcription model for voice input.".to_string()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             ..Default::default()
@@ -4886,28 +4856,32 @@ impl ChatWidget {
             self.add_error_message(error);
             return;
         }
-        self.add_info_message(format!("Voice model set to '{model}'."), None);
-        if model == crate::voice::TRANSCRIPTION_MODEL_OPENAI {
+        let is_local = model != crate::voice::TRANSCRIPTION_MODEL_OPENAI;
+        self.add_info_message(
+            if is_local {
+                format!("Voice model set to '{model}'. Downloading...")
+            } else {
+                format!("Voice model set to '{model}'.")
+            },
+            None,
+        );
+        if !is_local {
             return;
         }
-        self.add_info_message(format!("⏳ Downloading voice model '{model}'..."), None);
         let tx = self.app_event_tx.clone();
         let model_for_task = model.to_string();
         tokio::spawn(async move {
-            let result = crate::voice::prefetch_selected_transcription_model(&model_for_task).await;
-            match result {
-                Ok(()) => tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    history_cell::new_info_event(
-                        format!("Voice model '{model_for_task}' is ready for local transcription."),
-                        None,
-                    ),
-                ))),
-                Err(error) => tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    history_cell::new_error_event(format!(
-                        "Failed to download voice model '{model_for_task}': {error}"
-                    )),
-                ))),
-            }
+            let msg = match crate::voice::prefetch_selected_transcription_model(&model_for_task).await
+            {
+                Ok(()) => history_cell::new_info_event(
+                    format!("Voice model '{model_for_task}' ready."),
+                    None,
+                ),
+                Err(e) => history_cell::new_error_event(format!(
+                    "Download failed for '{model_for_task}': {e}"
+                )),
+            };
+            tx.send(AppEvent::InsertHistoryCell(Box::new(msg)));
         });
     }
 
