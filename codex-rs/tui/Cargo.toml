@@ -18,7 +18,7 @@ default = ["voice-input"]
 vt100-tests = []
 # Gate verbose debug logging inside the TUI implementation.
 debug-logs = []
-voice-input = ["dep:cpal", "dep:hound", "dep:transcribe-rs"]
+voice-input = ["dep:cpal", "dep:hf-hub", "dep:hound", "dep:transcribe-rs"]
 
 [lints]
 workspace = true
@@ -113,6 +113,7 @@ tokio-util = { workspace = true, features = ["time"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = { version = "0.15", optional = true }
+hf-hub = { version = "0.5.0", features = ["tokio"], optional = true }
 hound = { version = "3.5", optional = true }
 transcribe-rs = { version = "0.3", features = ["onnx"], optional = true }
 
