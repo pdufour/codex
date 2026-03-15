@@ -14,6 +14,7 @@ use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -30,6 +31,14 @@ use transcribe_rs::onnx::parakeet::ParakeetModel;
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
 const TRANSCRIBE_DEBUG_LOG: &str = "/tmp/debug.txt";
+const PARAKEET_MODEL_BASE_URL: &str =
+    "https://huggingface.co/smcleod/parakeet-tdt-0.6b-v3-int8/resolve/main";
+const PARAKEET_MODEL_FILES: [&str; 4] = [
+    "encoder-model.int8.onnx",
+    "decoder_joint-model.int8.onnx",
+    "nemo128.onnx",
+    "vocab.txt",
+];
 
 fn append_transcribe_debug_line(message: &str) {
     let mut file = match std::fs::OpenOptions::new()
@@ -774,6 +783,71 @@ fn resolve_model_dir() -> PathBuf {
 
 static MODEL: OnceLock<Result<std::sync::Mutex<ParakeetModel>, String>> = OnceLock::new();
 
+async fn ensure_parakeet_model_downloaded(model_dir: &Path) -> Result<(), String> {
+    let missing_files: Vec<&str> = PARAKEET_MODEL_FILES
+        .into_iter()
+        .filter(|file_name| !model_dir.join(file_name).is_file())
+        .collect();
+
+    if missing_files.is_empty() {
+        return Ok(());
+    }
+
+    append_transcribe_debug_line(&format!(
+        "model files missing in {}: {}",
+        model_dir.display(),
+        missing_files.join(", ")
+    ));
+
+    std::fs::create_dir_all(model_dir).map_err(|e| {
+        format!(
+            "failed to create model directory {}: {e}",
+            model_dir.display()
+        )
+    })?;
+
+    for file_name in missing_files {
+        let url = format!("{PARAKEET_MODEL_BASE_URL}/{file_name}");
+        let target = model_dir.join(file_name);
+        let partial = model_dir.join(format!("{file_name}.partial"));
+
+        append_transcribe_debug_line(&format!("downloading model file: {url}"));
+
+        let status = std::process::Command::new("curl")
+            .args([
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--output",
+            ])
+            .arg(&partial)
+            .arg(&url)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|e| format!("failed to execute curl for {file_name}: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "failed to download model file {file_name}: curl exit {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+
+        std::fs::rename(&partial, &target)
+            .map_err(|e| format!("failed to finalize model file {file_name}: {e}"))?;
+        let file_size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+
+        append_transcribe_debug_line(&format!(
+            "downloaded model file: {} ({} bytes)",
+            target.display(),
+            file_size
+        ));
+    }
+
+    Ok(())
+}
+
 fn get_or_init_model() -> Result<&'static std::sync::Mutex<ParakeetModel>, String> {
     let model_result = MODEL.get_or_init(|| {
         let model_dir = resolve_model_dir();
@@ -798,6 +872,14 @@ async fn transcribe_bytes(wav_bytes: Vec<u8>, _: Option<String>, _: f32) -> Resu
     if wav_bytes.is_empty() {
         append_transcribe_debug_line("transcribe_bytes error: empty audio buffer");
         return Err("No audio data".into());
+    }
+
+    let model_dir = resolve_model_dir();
+    if let Err(e) = ensure_parakeet_model_downloaded(&model_dir).await {
+        append_transcribe_debug_line(&format!(
+            "transcribe_bytes error: model download failed: {e}"
+        ));
+        return Err(e);
     }
 
     tokio::task::spawn_blocking(move || {
