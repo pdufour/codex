@@ -819,13 +819,13 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::VoiceTranscription,
         key: "voice_transcription",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::RealtimeConversation,
         key: "realtime_conversation",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::PreventIdleSleep,
