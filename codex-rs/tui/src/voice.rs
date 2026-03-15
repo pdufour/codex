@@ -41,7 +41,7 @@ pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
 pub(crate) const PARAKEET_REPO_ID: &str = "smcleod/parakeet-tdt-0.6b-v3-int8";
 const ALLOWED_LOCAL_VOICE_REPO_IDS: &[&str] = &[PARAKEET_REPO_ID];
 
-fn allowed_voice_models_display() -> String {
+fn allowed_voice_models() -> String {
     std::iter::once(TRANSCRIPTION_MODEL_OPENAI)
         .chain(ALLOWED_LOCAL_VOICE_REPO_IDS.iter().copied())
         .collect::<Vec<_>>()
@@ -49,10 +49,6 @@ fn allowed_voice_models_display() -> String {
 }
 
 static SELECTED_TRANSCRIPTION_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
-pub(crate) fn validate_transcription_model_selection() -> Result<(), String> {
-    resolve_transcription_model_selection().map(|_| ())
-}
 
 pub(crate) fn selected_transcription_model() -> Option<String> {
     let guard = SELECTED_TRANSCRIPTION_MODEL
@@ -63,33 +59,26 @@ pub(crate) fn selected_transcription_model() -> Option<String> {
 }
 
 pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> Result<(), String> {
-    let model = model.into();
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return Err("Voice model cannot be empty.".to_string());
-    }
+    let trimmed = model.into().trim().to_string();
     if trimmed != TRANSCRIPTION_MODEL_OPENAI
         && !ALLOWED_LOCAL_VOICE_REPO_IDS.iter().any(|id| *id == trimmed)
     {
         return Err(format!(
             "Unsupported voice model '{trimmed}'. Allowed values: {}.",
-            allowed_voice_models_display()
+            allowed_voice_models()
         ));
     }
     let mut guard = SELECTED_TRANSCRIPTION_MODEL
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("selected transcription model lock poisoned");
-    *guard = Some(trimmed.to_string());
+    *guard = Some(trimmed);
     Ok(())
 }
 
 fn resolve_transcription_model_selection() -> Result<String, String> {
     selected_transcription_model().ok_or_else(|| {
-        format!(
-            "Select transcription model with /voicemodel. Allowed values: {}.",
-            allowed_voice_models_display()
-        )
+        format!("Select transcription model with /voicemodel. Allowed values: {}.", allowed_voice_models())
     })
 }
 
@@ -117,7 +106,7 @@ pub struct VoiceCapture {
 
 impl VoiceCapture {
     pub fn start() -> Result<Self, String> {
-        validate_transcription_model_selection()?;
+        resolve_transcription_model_selection().map(|_| ())?;
         let (device, config) = select_default_input_device_and_config()?;
 
         let sample_rate = config.sample_rate().0;
