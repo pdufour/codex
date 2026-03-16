@@ -6,6 +6,7 @@ use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::CameraIndex;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
+use od_opencv::BBox;
 use od_opencv::ImageBuffer;
 use od_opencv::backend_ort::ModelUltralyticsOrt;
 use std::env;
@@ -152,14 +153,17 @@ impl AslYoloOrtModel {
         })
     }
 
-    fn detect_frame_rgb(&self, img: &image::RgbImage) -> Result<Option<(usize, f32)>, String> {
+    fn detect_frame_rgb(
+        &self,
+        img: &image::RgbImage,
+    ) -> Result<(Option<(usize, f32)>, Vec<(BBox, usize, f32)>), String> {
         let img_buf = ImageBuffer::from_dynamic_image(image::DynamicImage::ImageRgb8(img.clone()));
         let mut guard = self
             .model
             .lock()
             .map_err(|_| "ASL model lock poisoned".to_string())?;
 
-        let (_bboxes, class_ids, confidences) = guard
+        let (bboxes, class_ids, confidences) = guard
             .forward(&img_buf, 0.01, 0.45)
             .map_err(|e| format!("inference failed: {e}"))?;
 
@@ -172,24 +176,61 @@ impl AslYoloOrtModel {
             tracing::warn!(
                 "sign-language: absolutely no detections even at 0.01 confidence. (Check color space!)"
             );
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
 
-        for (i, class_id) in class_ids.iter().enumerate() {
-            let confidence = confidences.get(i).copied().unwrap_or(0.0);
+        let len = bboxes.len().min(class_ids.len()).min(confidences.len());
+        let mut detections: Vec<(BBox, usize, f32)> = Vec::with_capacity(len);
+        for i in 0..len {
+            let bbox = bboxes[i];
+            let class_id = class_ids[i];
+            let confidence = confidences[i];
             tracing::info!(
                 index = i,
                 class_id = class_id,
                 confidence = confidence,
+                x = bbox.x,
+                y = bbox.y,
+                width = bbox.width,
+                height = bbox.height,
                 "sign-language: detected class_id={class_id} confidence={confidence}"
             );
+            detections.push((bbox, class_id, confidence));
         }
 
-        let best = class_ids
-            .into_iter()
-            .zip(confidences.into_iter())
+        let best = detections
+            .iter()
+            .map(|(_, class_id, conf)| (*class_id, *conf))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(best)
+        Ok((best, detections))
+    }
+}
+
+fn draw_detection_overlay(img: &mut image::RgbImage, detections: &[(BBox, usize, f32)]) {
+    let green = image::Rgb([0, 255, 0]);
+    let (img_w, img_h) = img.dimensions();
+    for (bbox, _, _) in detections {
+        let x0 = bbox.x.max(0) as u32;
+        let y0 = bbox.y.max(0) as u32;
+        let x1 = (bbox.x + bbox.width - 1).max(0) as u32;
+        let y1 = (bbox.y + bbox.height - 1).max(0) as u32;
+        if x0 >= img_w || y0 >= img_h {
+            continue;
+        }
+        let x1 = x1.min(img_w.saturating_sub(1));
+        let y1 = y1.min(img_h.saturating_sub(1));
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+
+        for x in x0..=x1 {
+            img.put_pixel(x, y0, green);
+            img.put_pixel(x, y1, green);
+        }
+        for y in y0..=y1 {
+            img.put_pixel(x0, y, green);
+            img.put_pixel(x1, y, green);
+        }
     }
 }
 
@@ -250,15 +291,19 @@ impl SignLanguageModel for AslYoloOrtModel {
                 .decode_image::<RgbFormat>()
                 .map_err(|e| format!("failed to decode frame: {e}"))?;
 
+            let (prediction, detections) = self.detect_frame_rgb(&decoded)?;
+
             if let Some(ref dir) = debug_frames_dir {
                 let path = dir.join(format!("frame_{frame_index:03}.png"));
-                if let Err(e) = image::DynamicImage::ImageRgb8(decoded.clone()).save(&path) {
+                let mut overlay = decoded.clone();
+                draw_detection_overlay(&mut overlay, &detections);
+                if let Err(e) = image::DynamicImage::ImageRgb8(overlay).save(&path) {
                     tracing::warn!(path = %path.display(), error = %e, "sign-language: failed to write debug frame");
                 }
             }
             frame_index += 1;
 
-            if let Some((class_id, conf)) = self.detect_frame_rgb(&decoded)? {
+            if let Some((class_id, conf)) = prediction {
                 *counts.entry(class_id).or_insert(0) += 1;
                 *confidence_sums.entry(class_id).or_insert(0.0) += conf;
                 let letter = if class_id < ASL_CLASS_TO_LETTER.len() {
