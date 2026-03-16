@@ -4831,6 +4831,7 @@ impl ChatWidget {
                                     "Download failed for '{model_for_task}': {e}"
                                 )),
                             };
+                            tx_clone.send(AppEvent::ForceTerminalClear);
                             tx_clone.send(AppEvent::InsertHistoryCell(Box::new(msg)));
                         });
                     }
@@ -4886,6 +4887,7 @@ impl ChatWidget {
                         "Download failed for '{model_for_task}': {e}"
                     )),
                 };
+            tx.send(AppEvent::ForceTerminalClear);
             tx.send(AppEvent::InsertHistoryCell(Box::new(msg)));
         });
     }

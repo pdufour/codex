@@ -163,6 +163,10 @@ pub(crate) enum AppEvent {
 
     InsertHistoryCell(Box<dyn HistoryCell>),
 
+    /// Force the TUI to clear and fully redraw the terminal. Used to clean up
+    /// external writes to stderr (e.g. indicatif progress bars from hf_hub).
+    ForceTerminalClear,
+
     /// Apply rollback semantics to local transcript cells.
     ///
     /// This is emitted when rollback was not initiated by the current
