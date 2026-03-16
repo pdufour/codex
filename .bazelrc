@@ -29,8 +29,8 @@ common:windows --@rules_rust//rust/settings:experimental_use_sh_toolchain_for_bo
 common --incompatible_strict_action_env
 # Not ideal, but We need to allow dotslash to be found
 common:linux --test_env=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
 common:macos --test_env=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-common:macos --action_env=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 common:macos --action_env=HOME
 common:macos --linkopt=-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks
 common:macos --linkopt=-framework
@@ -45,8 +45,8 @@ common:windows --test_env=WINDIR
 
 common --test_output=errors
 common --bes_results_url=https://app.buildbuddy.io/invocation/
-# common --bes_backend=grpcs://remote.buildbuddy.io
-# common --remote_cache=grpcs://remote.buildbuddy.io
+common --bes_backend=grpcs://remote.buildbuddy.io
+common --remote_cache=grpcs://remote.buildbuddy.io
 common --remote_download_toplevel
 common --nobuild_runfile_links
 common --remote_timeout=3600
