@@ -136,6 +136,20 @@ fn resolve_transcription_model_selection() -> Result<String, String> {
     Ok(selected_transcription_model().unwrap_or_else(|| TRANSCRIPTION_MODEL_OPENAI.to_string()))
 }
 
+#[cfg(test)]
+pub(crate) fn resolve_transcription_model_selection_for_test() -> Result<String, String> {
+    resolve_transcription_model_selection()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_selected_transcription_model_for_test() {
+    let mut guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard = None;
+}
+
 struct TranscriptionAuthContext {
     mode: AuthMode,
     bearer_token: String,
@@ -1187,10 +1201,64 @@ async fn transcribe_bytes(
 #[cfg(test)]
 mod tests {
     use super::RecordedAudio;
+    use super::TRANSCRIPTION_MODEL_OPENAI;
+    use super::clear_selected_transcription_model_for_test;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
+    use super::resolve_transcription_model_selection_for_test;
+    use super::try_set_selected_transcription_model;
+    use super::voice_model_picker_options;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
+
+    /// Happy path: no voice model selected → defaults to OpenAI (transcribe_bytes route: openai).
+    #[test]
+    fn test_recording_with_no_voice_model_selected_uses_openai() {
+        clear_selected_transcription_model_for_test();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, TRANSCRIPTION_MODEL_OPENAI);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "openai");
+    }
+
+    /// Happy path: OpenAI selected → transcribe_bytes route: openai.
+    #[test]
+    fn test_recording_with_openai_selection_uses_openai() {
+        clear_selected_transcription_model_for_test();
+        try_set_selected_transcription_model(TRANSCRIPTION_MODEL_OPENAI).unwrap();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, TRANSCRIPTION_MODEL_OPENAI);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "openai");
+    }
+
+    /// Happy path: Parakeet (ONNX) selected → transcribe_bytes route: local.
+    #[test]
+    fn test_recording_with_parakeet_selection_uses_local_route() {
+        clear_selected_transcription_model_for_test();
+        let parakeet_id = voice_model_picker_options()
+            .into_iter()
+            .find(|(label, _, _)| *label == "Parakeet")
+            .map(|(_, id, _)| id.to_string())
+            .expect("Parakeet option should exist");
+        try_set_selected_transcription_model(&parakeet_id).unwrap();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, parakeet_id);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "local");
+    }
 
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {
