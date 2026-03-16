@@ -8,11 +8,14 @@ use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 use od_opencv::ImageBuffer;
 use od_opencv::backend_ort::ModelUltralyticsOrt;
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::task;
 
 /// Architecture / variant class of a local sign-language model.
@@ -156,8 +159,9 @@ impl AslYoloOrtModel {
             .model
             .lock()
             .map_err(|_| "ASL model lock poisoned".to_string())?;
+        // Match ASL-Detector-YOLO Space: conf=0.45, iou=0.7 (NMS).
         let (_bboxes, class_ids, confidences) = guard
-            .forward(&img_buf, 0.25, 0.45)
+            .forward(&img_buf, 0.45, 0.7)
             .map_err(|e| format!("inference failed: {e}"))?;
 
         let best = class_ids
@@ -179,15 +183,31 @@ impl SignLanguageModel for AslYoloOrtModel {
         cam.open_stream()
             .map_err(|e| format!("failed to start camera stream: {e}"))?;
 
+        let debug_frames_dir: Option<PathBuf> = env::var_os("CODEX_SIGN_DEBUG_FRAMES")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        if let Some(ref dir) = debug_frames_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
         let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-        let frames_to_sample = 10;
-        for _ in 0..frames_to_sample {
+        let capture_duration = Duration::from_secs(10);
+        let deadline = Instant::now() + capture_duration;
+        let mut frame_index = 0u32;
+        while Instant::now() < deadline {
             let frame = cam
                 .frame()
                 .map_err(|e| format!("failed to capture frame: {e}"))?;
             let decoded = frame
                 .decode_image::<RgbFormat>()
                 .map_err(|e| format!("failed to decode frame: {e}"))?;
+
+            if let Some(ref dir) = debug_frames_dir {
+                let path = dir.join(format!("frame_{frame_index:03}.png"));
+                let _ = image::DynamicImage::ImageRgb8(decoded.clone()).save(&path);
+            }
+            frame_index += 1;
+
             if let Some((class_id, _conf)) = self.detect_frame_rgb(&decoded)? {
                 *counts.entry(class_id).or_insert(0) += 1;
             }
