@@ -128,12 +128,7 @@ pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> 
 }
 
 fn resolve_transcription_model_selection() -> Result<String, String> {
-    selected_transcription_model().ok_or_else(|| {
-        format!(
-            "Select transcription model with /voicemodel. Allowed values: {}.",
-            allowed_voice_models()
-        )
-    })
+    Ok(selected_transcription_model().unwrap_or_else(|| TRANSCRIPTION_MODEL_OPENAI.to_string()))
 }
 
 struct TranscriptionAuthContext {
