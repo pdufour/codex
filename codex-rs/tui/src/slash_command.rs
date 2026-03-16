@@ -159,6 +159,7 @@ impl SlashCommand {
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
+            | SlashCommand::SignLetter
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills

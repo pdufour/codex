@@ -112,6 +112,10 @@ ort = { version = "2.0.0-rc.12" }
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
 
+[dependencies.nokhwa]
+version = "0.10"
+features = ["input-native"]
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }

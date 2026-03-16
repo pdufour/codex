@@ -1,10 +1,13 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use hf_hub::api::sync::Api as HfHubApi;
-use od_opencv::backend_ort::ModelUltralyticsOrt;
+use nokhwa::Camera;
+use nokhwa::pixel_format::RgbFormat;
+use nokhwa::utils::CameraIndex;
+use nokhwa::utils::RequestedFormat;
+use nokhwa::utils::RequestedFormatType;
 use od_opencv::ImageBuffer;
-use opencv::prelude::*;
-use opencv::{imgproc, videoio};
+use od_opencv::backend_ort::ModelUltralyticsOrt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -39,8 +42,8 @@ fn allowed_sign_language_repo_ids() -> impl Iterator<Item = &'static str> {
 }
 
 /// Options for the sign-language model picker: (display label, model id, description).
-pub(crate) fn sign_language_model_picker_options(
-) -> Vec<(&'static str, &'static str, &'static str)> {
+pub(crate) fn sign_language_model_picker_options() -> Vec<(&'static str, &'static str, &'static str)>
+{
     ALLOWED_SIGN_LANGUAGE_MODELS
         .iter()
         .map(|m| (m.label, m.repo_id, m.description))
@@ -57,12 +60,12 @@ pub(crate) fn selected_sign_language_model() -> Option<String> {
     guard.clone()
 }
 
-pub(crate) fn try_set_selected_sign_language_model(
-    model: impl Into<String>,
-) -> Result<(), String> {
+pub(crate) fn try_set_selected_sign_language_model(model: impl Into<String>) -> Result<(), String> {
     let trimmed = model.into().trim().to_string();
     if !allowed_sign_language_repo_ids().any(|id| id == trimmed) {
-        let allowed = allowed_sign_language_repo_ids().collect::<Vec<_>>().join(", ");
+        let allowed = allowed_sign_language_repo_ids()
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(format!(
             "Unsupported sign-language model '{trimmed}'. Allowed values: {allowed}."
         ));
@@ -100,41 +103,25 @@ struct AslYoloOrtModel {
 
 impl AslYoloOrtModel {
     fn new(model_path: &str) -> Result<Self, String> {
-        ort::init()
-            .commit()
-            .map_err(|e| format!("failed to initialize ONNX Runtime: {e}"))?;
+        let _ = ort::init();
         let net_size = (640, 640);
         let class_filters: Vec<usize> = Vec::new();
-        let model =
-            ModelUltralyticsOrt::new_from_file(model_path, net_size, class_filters).map_err(
-                |e| format!("failed to load ASL YOLO ONNX model from {model_path}: {e}"),
-            )?;
+        let model = ModelUltralyticsOrt::new_from_file(model_path, net_size, class_filters)
+            .map_err(|e| format!("failed to load ASL YOLO ONNX model from {model_path}: {e}"))?;
         Ok(Self {
             model: Mutex::new(model),
         })
     }
 
-    fn detect_frame(&self, frame: &Mat) -> Result<Option<(usize, f32)>, String> {
-        let mut rgb = Mat::default();
-        imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0)
-            .map_err(|e| format!("cvtColor failed: {e}"))?;
-        let h = rgb.rows();
-        let w = rgb.cols();
-        let data = rgb
-            .data_bytes()
-            .map_err(|e| format!("failed to read frame bytes: {e}"))?;
-        let img = image::RgbImage::from_raw(w as u32, h as u32, data.to_vec())
-            .ok_or_else(|| "failed to build RgbImage".to_string())?;
-        let img_buf = ImageBuffer::from_dynamic_image(image::DynamicImage::ImageRgb8(img));
-
+    fn detect_frame_rgb(&self, img: &image::RgbImage) -> Result<Option<(usize, f32)>, String> {
+        let img_buf = ImageBuffer::from_dynamic_image(image::DynamicImage::ImageRgb8(img.clone()));
         let mut guard = self
             .model
             .lock()
             .map_err(|_| "ASL model lock poisoned".to_string())?;
-        let (_bboxes, class_ids, confidences) =
-            guard
-                .forward(&img_buf, 0.25, 0.45)
-                .map_err(|e| format!("inference failed: {e}"))?;
+        let (_bboxes, class_ids, confidences) = guard
+            .forward(&img_buf, 0.25, 0.45)
+            .map_err(|e| format!("inference failed: {e}"))?;
 
         let best = class_ids
             .into_iter()
@@ -146,21 +133,22 @@ impl AslYoloOrtModel {
 
 impl SignLanguageModel for AslYoloOrtModel {
     fn transcribe_video(&self, _video: &RecordedVideo) -> Result<String, String> {
-        let mut cap =
-            videoio::VideoCapture::new(0, videoio::CAP_ANY).map_err(|e| format!("{e}"))?;
-        if !videoio::VideoCapture::is_opened(&cap).map_err(|e| format!("{e}"))? {
-            return Err("cannot open webcam for sign-language capture".to_string());
-        }
+        let index = CameraIndex::Index(0);
+        let requested =
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let mut cam =
+            Camera::new(index, requested).map_err(|e| format!("failed to open camera: {e}"))?;
 
         let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
         let frames_to_sample = 30;
         for _ in 0..frames_to_sample {
-            let mut frame = Mat::default();
-            cap.read(&mut frame).map_err(|e| format!("{e}"))?;
-            if frame.empty() {
-                continue;
-            }
-            if let Some((class_id, _conf)) = self.detect_frame(&frame)? {
+            let frame = cam
+                .frame()
+                .map_err(|e| format!("failed to capture frame: {e}"))?;
+            let decoded = frame
+                .decode_image::<RgbFormat>()
+                .map_err(|e| format!("failed to decode frame: {e}"))?;
+            if let Some((class_id, _conf)) = self.detect_frame_rgb(&decoded)? {
                 *counts.entry(class_id).or_insert(0) += 1;
             }
         }
@@ -179,11 +167,9 @@ impl SignLanguageModel for AslYoloOrtModel {
     }
 }
 
-static SIGN_LANGUAGE_MODEL_SLOT: OnceLock<Mutex<Option<(String, Box<dyn SignLanguageModel>)>>> =
-    OnceLock::new();
-
-fn load_model_for_class(class: SignLanguageModelClass) -> Result<Box<dyn SignLanguageModel>, String>
-{
+fn load_model_for_class(
+    class: SignLanguageModelClass,
+) -> Result<Box<dyn SignLanguageModel>, String> {
     match class {
         SignLanguageModelClass::Basic => {
             let model_path = ensure_sign_model_downloaded()?;
@@ -206,30 +192,9 @@ fn get_class_for_repo(repo_id: &str) -> Option<SignLanguageModelClass> {
 
 fn resolve_sign_language_model() -> Result<Box<dyn SignLanguageModel>, String> {
     let model_id = resolve_sign_language_model_selection()?;
-    let mut slot = SIGN_LANGUAGE_MODEL_SLOT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|e| format!("sign-language model slot lock poisoned: {e}"))?;
-    let needs_reload = slot
-        .as_ref()
-        .is_none_or(|(loaded_model_id, _)| loaded_model_id != &model_id);
-    if needs_reload {
-        let class = get_class_for_repo(&model_id)
-            .ok_or_else(|| format!("unknown sign-language model repo: {model_id}"))?;
-        let model = load_model_for_class(class)?;
-        *slot = Some((model_id.clone(), model));
-    }
-    let (_, model) = slot
-        .as_mut()
-        .ok_or_else(|| "internal error: sign-language model slot is empty".to_string())?;
-    // Clone the boxed trait object by creating a new wrapper that forwards to the same model.
-    struct ModelRef<'a>(&'a mut dyn SignLanguageModel);
-    impl<'a> SignLanguageModel for ModelRef<'a> {
-        fn transcribe_video(&self, video: &RecordedVideo) -> Result<String, String> {
-            self.0.transcribe_video(video)
-        }
-    }
-    Ok(Box::new(ModelRef(model.as_mut())))
+    let class = get_class_for_repo(&model_id)
+        .ok_or_else(|| format!("unknown sign-language model repo: {model_id}"))?;
+    load_model_for_class(class)
 }
 
 pub fn transcribe_video_async(id: String, video: RecordedVideo, tx: AppEventSender) {
@@ -265,4 +230,3 @@ fn ensure_sign_model_downloaded() -> Result<PathBuf, String> {
     repo.get(filename)
         .map_err(|e| format!("failed to download sign model {filename} from {repo_id}: {e}"))
 }
-
