@@ -19,6 +19,7 @@ vt100-tests = []
 # Gate verbose debug logging inside the TUI implementation.
 debug-logs = []
 voice-input = ["dep:cpal", "dep:hound"]
+sign-language = []
 
 [lints]
 workspace = true
@@ -60,6 +61,7 @@ diffy = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
+imageproc = "0.25"
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pathdiff = { workspace = true }
@@ -96,6 +98,7 @@ tokio = { workspace = true, features = [
 tokio-stream = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
+ab_glyph = "0.2"
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 syntect = "5"
@@ -105,9 +108,15 @@ unicode-width = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
 uuid = { workspace = true }
+od_opencv = "0.8"
+ort = { version = "2.0.0-rc.12" }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
+
+[dependencies.nokhwa]
+version = "0.10"
+features = ["input-native"]
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = { version = "0.15", optional = true }

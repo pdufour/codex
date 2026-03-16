@@ -13,6 +13,8 @@ pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
     Model,
+    #[strum(serialize = "signmodel", serialize = "sign-model")]
+    SignModel,
     Fast,
     Approvals,
     Permissions,
@@ -54,6 +56,8 @@ pub enum SlashCommand {
     Realtime,
     Settings,
     TestApproval,
+    #[strum(serialize = "signletter")]
+    SignLetter,
     #[strum(serialize = "subagents")]
     MultiAgents,
     // Debugging commands.
@@ -91,6 +95,7 @@ impl SlashCommand {
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
+            SlashCommand::SignModel => "set the sign-language input model",
             SlashCommand::Fast => "toggle Fast mode to enable fastest inference at 2X plan usage",
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
@@ -110,6 +115,7 @@ impl SlashCommand {
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
+            SlashCommand::SignLetter => "capture a sign letter from webcam",
         }
     }
 
@@ -127,6 +133,7 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
+                | SlashCommand::SignModel
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -156,6 +163,8 @@ impl SlashCommand {
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
+            | SlashCommand::SignLetter
+            | SlashCommand::SignModel
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
@@ -184,6 +193,9 @@ impl SlashCommand {
             SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
             SlashCommand::Copy => !cfg!(target_os = "android"),
             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
+            SlashCommand::SignLetter | SlashCommand::SignModel => {
+                cfg!(all(not(target_os = "linux"), feature = "sign-language"))
+            }
             _ => true,
         }
     }

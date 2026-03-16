@@ -111,6 +111,8 @@ mod resume_picker;
 mod selection_list;
 mod session_log;
 mod shimmer;
+#[cfg(all(not(target_os = "linux"), feature = "sign-language"))]
+mod sign_language;
 mod skills_helpers;
 mod slash_command;
 mod status;
