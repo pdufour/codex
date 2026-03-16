@@ -18,8 +18,14 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::task;
 
+/// Explicit ASL mapping skipping 'J' (25 classes total)
+const ASL_CLASS_TO_LETTER: &[&str] = &[
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+    "U", "V", "W", "X", "Y", "Z",
+];
+
 /// Architecture / variant class of a local sign-language model.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SignLanguageModelClass {
     AslYolo11n,
     AslYolo11s,
@@ -32,9 +38,7 @@ pub enum SignLanguageModelClass {
 pub struct AllowedSignLanguageModel {
     pub repo_id: &'static str,
     pub class: SignLanguageModelClass,
-    /// Display name in the model picker (e.g. "SignLang Basic").
     pub label: &'static str,
-    /// Short description for the picker.
     pub description: &'static str,
 }
 
@@ -81,7 +85,6 @@ pub(crate) fn allowed_sign_language_models() -> String {
         .join(", ")
 }
 
-/// Options for the sign-language model picker: (display label, model id, description).
 pub(crate) fn sign_language_model_picker_options() -> Vec<(&'static str, &'static str, &'static str)>
 {
     ALLOWED_SIGN_LANGUAGE_MODELS
@@ -123,16 +126,10 @@ fn resolve_sign_language_model_selection() -> Result<String, String> {
         .ok_or_else(|| "No sign-language model selected; use /signmodel to pick one.".to_string())
 }
 
-/// Simple in-process representation of a video recording.
-///
-/// This is intentionally minimal for now; callers are expected to construct it from whatever
-/// capture mechanism they use.
 pub struct RecordedVideo {
-    /// Opaque bytes for the recorded video or sequence of frames.
     pub data: Arc<Vec<u8>>,
 }
 
-/// Trait implemented by local sign-language models.
 pub trait SignLanguageModel: Send {
     fn transcribe_video(&self, video: &RecordedVideo) -> Result<String, String>;
 }
@@ -146,8 +143,10 @@ impl AslYoloOrtModel {
         let _ = ort::init();
         let net_size = (640, 640);
         let class_filters: Vec<usize> = Vec::new();
+        tracing::info!(model_path, "sign-language: loading ONNX model");
         let model = ModelUltralyticsOrt::new_from_file(model_path, net_size, class_filters)
             .map_err(|e| format!("failed to load ASL YOLO ONNX model from {model_path}: {e}"))?;
+        tracing::info!(model_path, "sign-language: model loaded");
         Ok(Self {
             model: Mutex::new(model),
         })
@@ -159,10 +158,32 @@ impl AslYoloOrtModel {
             .model
             .lock()
             .map_err(|_| "ASL model lock poisoned".to_string())?;
-        // Match ASL-Detector-YOLO Space: conf=0.45, iou=0.7 (NMS).
+
         let (_bboxes, class_ids, confidences) = guard
-            .forward(&img_buf, 0.45, 0.7)
+            .forward(&img_buf, 0.01, 0.45)
             .map_err(|e| format!("inference failed: {e}"))?;
+
+        tracing::info!(
+            detections = class_ids.len(),
+            "sign-language: frame inference completed"
+        );
+
+        if class_ids.is_empty() {
+            tracing::warn!(
+                "sign-language: absolutely no detections even at 0.01 confidence. (Check color space!)"
+            );
+            return Ok(None);
+        }
+
+        for (i, class_id) in class_ids.iter().enumerate() {
+            let confidence = confidences.get(i).copied().unwrap_or(0.0);
+            tracing::info!(
+                index = i,
+                class_id = class_id,
+                confidence = confidence,
+                "sign-language: detected class_id={class_id} confidence={confidence}"
+            );
+        }
 
         let best = class_ids
             .into_iter()
@@ -177,24 +198,51 @@ impl SignLanguageModel for AslYoloOrtModel {
         let index = CameraIndex::Index(0);
         let requested =
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        tracing::info!("sign-language: opening camera");
         let mut cam =
             Camera::new(index, requested).map_err(|e| format!("failed to open camera: {e}"))?;
         #[cfg(target_os = "macos")]
+        tracing::info!("sign-language: opening camera stream");
+        #[cfg(target_os = "macos")]
         cam.open_stream()
             .map_err(|e| format!("failed to start camera stream: {e}"))?;
+        tracing::info!("sign-language: camera ready");
 
         let debug_frames_dir: Option<PathBuf> = env::var_os("CODEX_SIGN_DEBUG_FRAMES")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
+            .map(|v| {
+                let s = v.to_string_lossy();
+                if s.eq_ignore_ascii_case("1")
+                    || s.eq_ignore_ascii_case("true")
+                    || s.eq_ignore_ascii_case("yes")
+                {
+                    PathBuf::from("/tmp/codex-debug-frames")
+                } else {
+                    PathBuf::from(v)
+                }
+            });
+
         if let Some(ref dir) = debug_frames_dir {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(path = %dir.display(), error = %e, "sign-language: failed to create debug frames dir");
+            } else {
+                tracing::info!(path = %dir.display(), "sign-language: writing debug frames");
+            }
         }
 
         let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-        let capture_duration = Duration::from_secs(10);
+        let mut confidence_sums: std::collections::HashMap<usize, f32> =
+            std::collections::HashMap::new();
+        let capture_duration = Duration::from_secs(5);
         let deadline = Instant::now() + capture_duration;
         let mut frame_index = 0u32;
+        tracing::info!(
+            capture_seconds = capture_duration.as_secs(),
+            "sign-language: capture started"
+        );
+
         while Instant::now() < deadline {
+            let current_frame_index = frame_index;
             let frame = cam
                 .frame()
                 .map_err(|e| format!("failed to capture frame: {e}"))?;
@@ -204,24 +252,72 @@ impl SignLanguageModel for AslYoloOrtModel {
 
             if let Some(ref dir) = debug_frames_dir {
                 let path = dir.join(format!("frame_{frame_index:03}.png"));
-                let _ = image::DynamicImage::ImageRgb8(decoded.clone()).save(&path);
+                if let Err(e) = image::DynamicImage::ImageRgb8(decoded.clone()).save(&path) {
+                    tracing::warn!(path = %path.display(), error = %e, "sign-language: failed to write debug frame");
+                }
             }
             frame_index += 1;
 
-            if let Some((class_id, _conf)) = self.detect_frame_rgb(&decoded)? {
+            if let Some((class_id, conf)) = self.detect_frame_rgb(&decoded)? {
                 *counts.entry(class_id).or_insert(0) += 1;
+                *confidence_sums.entry(class_id).or_insert(0.0) += conf;
+                let letter = if class_id < ASL_CLASS_TO_LETTER.len() {
+                    ASL_CLASS_TO_LETTER[class_id]
+                } else {
+                    "?"
+                };
+                tracing::info!(
+                    frame_index = current_frame_index,
+                    class_id = class_id,
+                    letter = %letter,
+                    confidence = conf,
+                    "sign-language: frame prediction"
+                );
+            } else {
+                tracing::info!(
+                    frame_index = current_frame_index,
+                    "sign-language: frame prediction none"
+                );
             }
         }
+        tracing::info!(
+            frames_captured = frame_index,
+            "sign-language: capture finished"
+        );
+        tracing::info!(vote_counts = ?counts, "sign-language: class vote summary");
+        tracing::info!(
+            confidence_sums = ?confidence_sums,
+            "sign-language: class confidence summary"
+        );
 
-        let best_class = counts
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(class_id, _)| class_id);
+        let best_class = confidence_sums
+            .iter()
+            .max_by(|(class_a, sum_a), (class_b, sum_b)| {
+                sum_a
+                    .partial_cmp(sum_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        counts
+                            .get(class_a)
+                            .unwrap_or(&0)
+                            .cmp(counts.get(class_b).unwrap_or(&0))
+                    })
+                    .then_with(|| class_b.cmp(class_a))
+            })
+            .map(|(class_id, _)| *class_id);
 
         if let Some(class_id) = best_class {
-            let ch = (b'A' + (class_id as u8)) as char;
-            Ok(ch.to_string())
+            // Safely map to the correct ASL letter array
+            let letter = if class_id < ASL_CLASS_TO_LETTER.len() {
+                ASL_CLASS_TO_LETTER[class_id]
+            } else {
+                "?"
+            };
+
+            tracing::info!(class_id, letter = %letter, "sign-language: final prediction");
+            Ok(letter.to_string())
         } else {
+            tracing::warn!("sign-language: no winning class after capture window");
             Ok("(no sign detected)".to_string())
         }
     }
@@ -230,6 +326,7 @@ impl SignLanguageModel for AslYoloOrtModel {
 fn load_model_for_class(
     class: SignLanguageModelClass,
 ) -> Result<Box<dyn SignLanguageModel>, String> {
+    tracing::info!(?class, "sign-language: resolving model class");
     let filename = match class {
         SignLanguageModelClass::AslYolo11n => "yolo11n.onnx",
         SignLanguageModelClass::AslYolo11s => "yolo11s.onnx",
@@ -239,6 +336,7 @@ fn load_model_for_class(
     };
 
     let model_path = ensure_sign_model_downloaded(filename)?;
+    tracing::info!(filename, path = %model_path.display(), "sign-language: model ready on disk");
     let model = AslYoloOrtModel::new(
         model_path
             .to_str()
@@ -256,6 +354,7 @@ fn get_class_for_repo(repo_id: &str) -> Option<SignLanguageModelClass> {
 
 fn resolve_sign_language_model() -> Result<Box<dyn SignLanguageModel>, String> {
     let model_id = resolve_sign_language_model_selection()?;
+    tracing::info!(model_id, "sign-language: selected model id");
     let class = get_class_for_repo(&model_id)
         .ok_or_else(|| format!("unknown sign-language model repo: {model_id}"))?;
     load_model_for_class(class)
@@ -302,7 +401,6 @@ pub fn capture_sign_letter() -> Result<String, String> {
 }
 
 fn ensure_sign_model_downloaded(filename: &str) -> Result<PathBuf, String> {
-    // Download the chosen ASL YOLO ONNX model from the per-user repo.
     let repo_id = "pdufour/asl-yolo-models-onnx";
     let api = HfHubApi::new().map_err(|e| format!("failed to init hf-hub API: {e}"))?;
     let repo = api.model(repo_id.to_string());
