@@ -29,6 +29,9 @@ const ASL_CLASS_TO_LETTER: &[&str] = &[
     "U", "V", "W", "X", "Y", "Z",
 ];
 
+const SIGN_CONF_THRESHOLD: f32 = 0.45;
+const SIGN_IOU_THRESHOLD: f32 = 0.7;
+
 /// Architecture / variant class of a local sign-language model.
 #[derive(Clone, Copy, Debug)]
 pub enum SignLanguageModelClass {
@@ -149,8 +152,10 @@ impl AslYoloOrtModel {
         let net_size = (640, 640);
         let class_filters: Vec<usize> = Vec::new();
         tracing::info!(model_path, "sign-language: loading ONNX model");
-        let model = ModelUltralyticsOrt::new_from_file(model_path, net_size, class_filters)
+        let mut model = ModelUltralyticsOrt::new_from_file(model_path, net_size, class_filters)
             .map_err(|e| format!("failed to load ASL YOLO ONNX model from {model_path}: {e}"))?;
+        model.set_letterbox(true);
+        tracing::info!("sign-language: enabled letterbox preprocessing");
         tracing::info!(model_path, "sign-language: model loaded");
         Ok(Self {
             model: Mutex::new(model),
@@ -168,7 +173,7 @@ impl AslYoloOrtModel {
             .map_err(|_| "ASL model lock poisoned".to_string())?;
 
         let (bboxes, class_ids, confidences) = guard
-            .forward(&img_buf, 0.01, 0.45)
+            .forward(&img_buf, SIGN_CONF_THRESHOLD, SIGN_IOU_THRESHOLD)
             .map_err(|e| format!("inference failed: {e}"))?;
 
         tracing::info!(
@@ -177,9 +182,7 @@ impl AslYoloOrtModel {
         );
 
         if class_ids.is_empty() {
-            tracing::warn!(
-                "sign-language: absolutely no detections even at 0.01 confidence. (Check color space!)"
-            );
+            tracing::warn!("sign-language: no detections with app thresholds");
             return Ok((None, Vec::new()));
         }
 
@@ -202,11 +205,16 @@ impl AslYoloOrtModel {
             detections.push((bbox, class_id, confidence));
         }
 
+        // Match Python app max_det=1: keep only top-confidence detection.
         let best = detections
             .iter()
             .map(|(_, class_id, conf)| (*class_id, *conf))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok((best, detections))
+        let top_only = detections
+            .into_iter()
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map_or_else(Vec::new, |det| vec![det]);
+        Ok((best, top_only))
     }
 }
 
@@ -352,7 +360,15 @@ impl SignLanguageModel for AslYoloOrtModel {
             if let Some(ref dir) = debug_frames_dir {
                 let path = dir.join(format!("frame_{frame_index:03}.png"));
                 let mut overlay = decoded.clone();
-                draw_detection_overlay(&mut overlay, &detections);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    draw_detection_overlay(&mut overlay, &detections);
+                }))
+                .is_err()
+                {
+                    tracing::warn!(
+                        "sign-language: overlay drawing panicked; saving raw frame instead"
+                    );
+                }
                 if let Err(e) = image::DynamicImage::ImageRgb8(overlay).save(&path) {
                     tracing::warn!(path = %path.display(), error = %e, "sign-language: failed to write debug frame");
                 }
