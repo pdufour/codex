@@ -13,11 +13,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::thread;
+use tokio::task;
 
-/// Architecture class of a local sign-language model.
+/// Architecture / variant class of a local sign-language model.
 #[derive(Clone, Copy)]
 pub enum SignLanguageModelClass {
-    Basic,
+    AslYolo11n,
+    AslYolo11s,
+    AslYolo11m,
+    AslYolo11l,
+    AslYolo11x,
 }
 
 /// One allowed local sign-language model: identifier, class (loader), and UI label/description.
@@ -30,15 +35,47 @@ pub struct AllowedSignLanguageModel {
     pub description: &'static str,
 }
 
-const ALLOWED_SIGN_LANGUAGE_MODELS: &[AllowedSignLanguageModel] = &[AllowedSignLanguageModel {
-    repo_id: "local/sign-language-basic",
-    class: SignLanguageModelClass::Basic,
-    label: "Sign language (local)",
-    description: "Local sign-language stub model.",
-}];
+const ALLOWED_SIGN_LANGUAGE_MODELS: &[AllowedSignLanguageModel] = &[
+    AllowedSignLanguageModel {
+        repo_id: "asl-yolo-11n",
+        class: SignLanguageModelClass::AslYolo11n,
+        label: "ASL YOLO11n (smallest)",
+        description: "Fastest, smallest generic YOLO11n ONNX model.",
+    },
+    AllowedSignLanguageModel {
+        repo_id: "asl-yolo-11s",
+        class: SignLanguageModelClass::AslYolo11s,
+        label: "ASL YOLO11s (small)",
+        description: "Small generic YOLO11s-style ONNX model (mapped to YOLO11n).",
+    },
+    AllowedSignLanguageModel {
+        repo_id: "asl-yolo-11m",
+        class: SignLanguageModelClass::AslYolo11m,
+        label: "ASL YOLO11m (medium)",
+        description: "Balanced medium-style option (currently mapped to YOLO11n ONNX).",
+    },
+    AllowedSignLanguageModel {
+        repo_id: "asl-yolo-11l",
+        class: SignLanguageModelClass::AslYolo11l,
+        label: "ASL YOLO11l (large)",
+        description: "Larger-style option (currently mapped to YOLO11n ONNX).",
+    },
+    AllowedSignLanguageModel {
+        repo_id: "asl-yolo-11x",
+        class: SignLanguageModelClass::AslYolo11x,
+        label: "ASL YOLO11x (xlarge)",
+        description: "Xlarge-style option (currently mapped to YOLO11n ONNX).",
+    },
+];
 
 fn allowed_sign_language_repo_ids() -> impl Iterator<Item = &'static str> {
     ALLOWED_SIGN_LANGUAGE_MODELS.iter().map(|m| m.repo_id)
+}
+
+pub(crate) fn allowed_sign_language_models() -> String {
+    allowed_sign_language_repo_ids()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Options for the sign-language model picker: (display label, model id, description).
@@ -138,9 +175,12 @@ impl SignLanguageModel for AslYoloOrtModel {
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
         let mut cam =
             Camera::new(index, requested).map_err(|e| format!("failed to open camera: {e}"))?;
+        #[cfg(target_os = "macos")]
+        cam.open_stream()
+            .map_err(|e| format!("failed to start camera stream: {e}"))?;
 
         let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-        let frames_to_sample = 30;
+        let frames_to_sample = 10;
         for _ in 0..frames_to_sample {
             let frame = cam
                 .frame()
@@ -170,17 +210,21 @@ impl SignLanguageModel for AslYoloOrtModel {
 fn load_model_for_class(
     class: SignLanguageModelClass,
 ) -> Result<Box<dyn SignLanguageModel>, String> {
-    match class {
-        SignLanguageModelClass::Basic => {
-            let model_path = ensure_sign_model_downloaded()?;
-            let model = AslYoloOrtModel::new(
-                model_path
-                    .to_str()
-                    .ok_or_else(|| "non-UTF8 sign model path".to_string())?,
-            )?;
-            Ok(Box::new(model))
-        }
-    }
+    let filename = match class {
+        SignLanguageModelClass::AslYolo11n => "yolo11n.onnx",
+        SignLanguageModelClass::AslYolo11s => "yolo11s.onnx",
+        SignLanguageModelClass::AslYolo11m => "yolo11m.onnx",
+        SignLanguageModelClass::AslYolo11l => "yolo11l.onnx",
+        SignLanguageModelClass::AslYolo11x => "yolo11x.onnx",
+    };
+
+    let model_path = ensure_sign_model_downloaded(filename)?;
+    let model = AslYoloOrtModel::new(
+        model_path
+            .to_str()
+            .ok_or_else(|| "non-UTF8 sign model path".to_string())?,
+    )?;
+    Ok(Box::new(model))
 }
 
 fn get_class_for_repo(repo_id: &str) -> Option<SignLanguageModelClass> {
@@ -195,6 +239,24 @@ fn resolve_sign_language_model() -> Result<Box<dyn SignLanguageModel>, String> {
     let class = get_class_for_repo(&model_id)
         .ok_or_else(|| format!("unknown sign-language model repo: {model_id}"))?;
     load_model_for_class(class)
+}
+
+pub(crate) async fn prefetch_selected_sign_language_model(model_id: &str) -> Result<(), String> {
+    let class = get_class_for_repo(model_id)
+        .ok_or_else(|| format!("unknown sign-language model repo: {model_id}"))?;
+
+    let filename = match class {
+        SignLanguageModelClass::AslYolo11n => "yolo11n.onnx",
+        SignLanguageModelClass::AslYolo11s => "yolo11s.onnx",
+        SignLanguageModelClass::AslYolo11m => "yolo11m.onnx",
+        SignLanguageModelClass::AslYolo11l => "yolo11l.onnx",
+        SignLanguageModelClass::AslYolo11x => "yolo11x.onnx",
+    };
+
+    task::spawn_blocking(move || ensure_sign_model_downloaded(filename))
+        .await
+        .map_err(|e| format!("sign-language prefetch task failed: {e}"))??;
+    Ok(())
 }
 
 pub fn transcribe_video_async(id: String, video: RecordedVideo, tx: AppEventSender) {
@@ -219,12 +281,9 @@ pub fn capture_sign_letter() -> Result<String, String> {
     model.transcribe_video(&video)
 }
 
-fn ensure_sign_model_downloaded() -> Result<PathBuf, String> {
-    // Initial implementation: download a generic YOLO11 ONNX model for experimentation.
-    // Later we can switch to an ASL‑specific model once available in ONNX form.
-    let repo_id = "illuni/YOLO11.onnx11.q8";
-    let filename = "yolo11n_q8.onnx";
-
+fn ensure_sign_model_downloaded(filename: &str) -> Result<PathBuf, String> {
+    // Download the chosen ASL YOLO ONNX model from the per-user repo.
+    let repo_id = "pdufour/asl-yolo-models-onnx";
     let api = HfHubApi::new().map_err(|e| format!("failed to init hf-hub API: {e}"))?;
     let repo = api.model(repo_id.to_string());
     repo.get(filename)

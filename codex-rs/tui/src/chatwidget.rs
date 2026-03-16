@@ -4358,6 +4358,18 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::SignModel => {
+                #[cfg(all(not(target_os = "linux"), feature = "sign-language"))]
+                {
+                    self.open_sign_language_model_popup();
+                }
+                #[cfg(not(all(not(target_os = "linux"), feature = "sign-language")))]
+                {
+                    self.add_error_message(
+                        "Sign-language input is unavailable in this build.".to_string(),
+                    );
+                }
+            }
             SlashCommand::Fast => {
                 let next_tier = if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
                     None
@@ -4682,6 +4694,26 @@ impl ChatWidget {
                     }
                 }
             }
+            SlashCommand::SignModel => {
+                #[cfg(all(not(target_os = "linux"), feature = "sign-language"))]
+                {
+                    if trimmed.is_empty() {
+                        self.dispatch_command(cmd);
+                        return;
+                    }
+                    if trimmed.eq_ignore_ascii_case("status") {
+                        self.show_sign_language_model_status();
+                    } else {
+                        self.set_sign_language_model(trimmed);
+                    }
+                }
+                #[cfg(not(all(not(target_os = "linux"), feature = "sign-language")))]
+                {
+                    self.add_error_message(
+                        "Sign-language input is unavailable in this build.".to_string(),
+                    );
+                }
+            }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.session_telemetry
                     .counter("codex.thread.rename", 1, &[]);
@@ -4761,6 +4793,121 @@ impl ChatWidget {
             }
             _ => self.dispatch_command(cmd),
         }
+    }
+
+    fn show_sign_language_model_status(&mut self) {
+        let allowed = crate::sign_language::allowed_sign_language_models();
+        match crate::sign_language::selected_sign_language_model() {
+            Some(value) => self.add_info_message(
+                format!("Sign-language model: {value}. Use /signmodel with: {allowed}."),
+                None,
+            ),
+            None => self.add_info_message(
+                format!("Sign-language model not set. Use /signmodel to pick one: {allowed}."),
+                None,
+            ),
+        }
+    }
+
+    fn open_sign_language_model_popup(&mut self) {
+        let current_model = crate::sign_language::selected_sign_language_model();
+        let sign_models = crate::sign_language::sign_language_model_picker_options();
+
+        let items: Vec<SelectionItem> = sign_models
+            .into_iter()
+            .map(|(name, model, description)| {
+                let model_for_action = model.to_string();
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    if let Err(error) = crate::sign_language::try_set_selected_sign_language_model(
+                        model_for_action.clone(),
+                    ) {
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_error_event(error),
+                        )));
+                        return;
+                    }
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_info_event(
+                            format!("Sign-language model set to '{model_for_action}'."),
+                            None,
+                        ),
+                    )));
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_info_event(
+                            format!("⏳ Downloading '{model_for_action}'..."),
+                            None,
+                        ),
+                    )));
+                    let tx_clone = tx.clone();
+                    let model_for_task = model_for_action.clone();
+                    tokio::spawn(async move {
+                        let msg = match crate::sign_language::prefetch_selected_sign_language_model(
+                            &model_for_task,
+                        )
+                        .await
+                        {
+                            Ok(()) => history_cell::new_info_event(
+                                format!("Sign-language model '{model_for_task}' ready."),
+                                None,
+                            ),
+                            Err(e) => history_cell::new_error_event(format!(
+                                "Download failed for '{model_for_task}': {e}"
+                            )),
+                        };
+                        tx_clone.send(AppEvent::ForceTerminalClear);
+                        tx_clone.send(AppEvent::InsertHistoryCell(Box::new(msg)));
+                    });
+                })];
+
+                SelectionItem {
+                    name: name.to_string(),
+                    description: Some(description.to_string()),
+                    is_current: current_model.as_deref() == Some(model),
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Sign-Language Model".to_string()),
+            subtitle: Some("Local model used for sign-language input.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    fn set_sign_language_model(&mut self, model: &str) {
+        if let Err(error) =
+            crate::sign_language::try_set_selected_sign_language_model(model.to_string())
+        {
+            self.add_error_message(error);
+            return;
+        }
+        self.add_info_message(
+            format!("Sign-language model set to '{model}'. Downloading..."),
+            None,
+        );
+        let tx = self.app_event_tx.clone();
+        let model_for_task = model.to_string();
+        tokio::spawn(async move {
+            let msg =
+                match crate::sign_language::prefetch_selected_sign_language_model(&model_for_task)
+                    .await
+                {
+                    Ok(()) => history_cell::new_info_event(
+                        format!("Sign-language model '{model_for_task}' ready."),
+                        None,
+                    ),
+                    Err(e) => history_cell::new_error_event(format!(
+                        "Download failed for '{model_for_task}': {e}"
+                    )),
+                };
+            tx.send(AppEvent::ForceTerminalClear);
+            tx.send(AppEvent::InsertHistoryCell(Box::new(msg)));
+        });
     }
 
     fn show_rename_prompt(&mut self) {
