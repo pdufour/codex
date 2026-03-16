@@ -1,6 +1,10 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use hf_hub::api::sync::Api as HfHubApi;
+use imageproc::drawing::draw_filled_rect_mut;
+use imageproc::drawing::draw_hollow_rect_mut;
+use imageproc::drawing::draw_text_mut;
+use imageproc::rect::Rect;
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::CameraIndex;
@@ -206,10 +210,38 @@ impl AslYoloOrtModel {
     }
 }
 
+fn try_load_overlay_font() -> Option<ab_glyph::FontArc> {
+    // Prefer common system fonts instead of bundling assets.
+    let candidates = [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(font) = ab_glyph::FontArc::try_from_vec(bytes)
+        {
+            return Some(font);
+        }
+    }
+    None
+}
+
+fn overlay_font() -> Option<&'static ab_glyph::FontArc> {
+    static FONT: OnceLock<Option<ab_glyph::FontArc>> = OnceLock::new();
+    FONT.get_or_init(try_load_overlay_font).as_ref()
+}
+
 fn draw_detection_overlay(img: &mut image::RgbImage, detections: &[(BBox, usize, f32)]) {
-    let green = image::Rgb([0, 255, 0]);
+    let red = image::Rgb([255, 0, 0]);
+    let white = image::Rgb([255, 255, 255]);
+    let text_scale = 18.0f32;
     let (img_w, img_h) = img.dimensions();
-    for (bbox, _, _) in detections {
+    let font = overlay_font();
+    for (bbox, class_id, confidence) in detections {
         let x0 = bbox.x.max(0) as u32;
         let y0 = bbox.y.max(0) as u32;
         let x1 = (bbox.x + bbox.width - 1).max(0) as u32;
@@ -223,13 +255,37 @@ fn draw_detection_overlay(img: &mut image::RgbImage, detections: &[(BBox, usize,
             continue;
         }
 
-        for x in x0..=x1 {
-            img.put_pixel(x, y0, green);
-            img.put_pixel(x, y1, green);
-        }
-        for y in y0..=y1 {
-            img.put_pixel(x0, y, green);
-            img.put_pixel(x1, y, green);
+        let rect = Rect::at(x0 as i32, y0 as i32).of_size(
+            (x1.saturating_sub(x0)).max(1) + 1,
+            (y1.saturating_sub(y0)).max(1) + 1,
+        );
+        draw_hollow_rect_mut(img, rect, red);
+
+        let letter = if *class_id < ASL_CLASS_TO_LETTER.len() {
+            ASL_CLASS_TO_LETTER[*class_id]
+        } else {
+            "?"
+        };
+        let label = format!("{letter} {:.2}", confidence);
+        let label_w = ((label.len() as u32) * 10).max(36);
+        let label_h = 22u32;
+        let label_x = x0;
+        let label_y = y0.saturating_sub(label_h);
+        let bg_rect = Rect::at(label_x as i32, label_y as i32).of_size(
+            label_w.min(img_w.saturating_sub(label_x)),
+            label_h.min(img_h.saturating_sub(label_y)),
+        );
+        draw_filled_rect_mut(img, bg_rect, red);
+        if let Some(font) = font {
+            draw_text_mut(
+                img,
+                white,
+                (label_x + 3) as i32,
+                (label_y + 2) as i32,
+                text_scale,
+                font,
+                &label,
+            );
         }
     }
 }

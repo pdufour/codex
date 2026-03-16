@@ -61,6 +61,7 @@ diffy = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
+imageproc = "0.25"
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pathdiff = { workspace = true }
@@ -97,6 +98,7 @@ tokio = { workspace = true, features = [
 tokio-stream = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
+ab_glyph = "0.2"
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 syntect = "5"
