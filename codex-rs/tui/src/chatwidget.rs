@@ -4539,6 +4539,21 @@ impl ChatWidget {
             SlashCommand::Mention => {
                 self.insert_str("@");
             }
+            SlashCommand::SignLetter => {
+                #[cfg(all(not(target_os = "linux"), feature = "sign-language"))]
+                {
+                    match crate::sign_language::capture_sign_letter() {
+                        Ok(text) => self.insert_str(&text),
+                        Err(e) => self.add_error_message(format!("Sign detection failed: {e}")),
+                    }
+                }
+                #[cfg(not(all(not(target_os = "linux"), feature = "sign-language")))]
+                {
+                    self.add_error_message(
+                        "Sign-language input is unavailable in this build.".to_string(),
+                    );
+                }
+            }
             SlashCommand::Skills => {
                 self.open_skills_menu();
             }

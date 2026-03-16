@@ -19,6 +19,7 @@ vt100-tests = []
 # Gate verbose debug logging inside the TUI implementation.
 debug-logs = []
 voice-input = ["dep:cpal", "dep:hound"]
+sign-language = []
 
 [lints]
 workspace = true
@@ -105,6 +106,8 @@ unicode-width = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
 uuid = { workspace = true }
+od_opencv = "0.8"
+ort = { version = "2.0.0-rc.12" }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }

@@ -129,6 +129,8 @@ mod updates;
 mod version;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 mod voice;
+#[cfg(all(not(target_os = "linux"), feature = "sign-language"))]
+mod sign_language;
 #[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
 mod voice {
     use crate::app_event::AppEvent;
