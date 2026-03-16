@@ -140,6 +140,40 @@ mod voice {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
 
+    pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
+
+    pub(crate) fn voice_input_available() -> bool {
+        false
+    }
+
+    pub(crate) fn allowed_voice_models() -> String {
+        TRANSCRIPTION_MODEL_OPENAI.to_string()
+    }
+
+    pub(crate) fn selected_transcription_model() -> Option<String> {
+        Some(TRANSCRIPTION_MODEL_OPENAI.to_string())
+    }
+
+    pub(crate) fn voice_model_picker_options() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![(
+            "OpenAI",
+            TRANSCRIPTION_MODEL_OPENAI,
+            "Hosted transcription.",
+        )]
+    }
+
+    pub(crate) fn try_set_selected_transcription_model(
+        _model: impl Into<String>,
+    ) -> Result<(), String> {
+        Err("voice input is unavailable in this build".to_string())
+    }
+
+    pub(crate) async fn prefetch_selected_transcription_model(
+        _model_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     pub struct RecordedAudio {
         pub data: Vec<i16>,
         pub sample_rate: u32,

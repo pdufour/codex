@@ -14,23 +14,141 @@ use codex_protocol::protocol::RealtimeAudioFrame;
 use cpal::traits::DeviceTrait;
 use cpal::traits::HostTrait;
 use cpal::traits::StreamTrait;
+use hf_hub::api::tokio::Api as HfHubApi;
 use hound::SampleFormat;
+use hound::WavReader;
 use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
+use transcribe_rs::SpeechModel;
+use transcribe_rs::onnx::Quantization;
+use transcribe_rs::onnx::parakeet::ParakeetModel;
 
-const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
+/// Sample rate expected by local ONNX models. Pipeline stays at 24k; we resample to this for local only.
+const LOCAL_MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
+const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
+pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
+
+/// True when this build has voice input support (voice-input feature enabled).
+pub(crate) fn voice_input_available() -> bool {
+    true
+}
+
+/// Architecture class of a local transcription model; selects the loader used for a repo.
+#[derive(Clone, Copy)]
+enum LocalVoiceModelClass {
+    Parakeet,
+}
+
+/// One allowed local voice model: repo ID, class (loader), and UI label/description. This is the single list of allowed local models.
+struct AllowedLocalVoiceModel {
+    repo_id: &'static str,
+    class: LocalVoiceModelClass,
+    /// Display name in the voice model picker (e.g. "Parakeet").
+    label: &'static str,
+    /// Short description for the picker (e.g. "Local ONNX, on-demand download.").
+    description: &'static str,
+}
+
+const ALLOWED_LOCAL_VOICE_MODELS: &[AllowedLocalVoiceModel] = &[AllowedLocalVoiceModel {
+    repo_id: "smcleod/parakeet-tdt-0.6b-v3-int8",
+    class: LocalVoiceModelClass::Parakeet,
+    label: "Parakeet",
+    description: "Local ONNX, on-demand download.",
+}];
+
+fn get_class_for_repo(repo_id: &str) -> Option<LocalVoiceModelClass> {
+    ALLOWED_LOCAL_VOICE_MODELS
+        .iter()
+        .find(|m| m.repo_id == repo_id)
+        .map(|m| m.class)
+}
+
+fn allowed_local_voice_repo_ids() -> impl Iterator<Item = &'static str> {
+    ALLOWED_LOCAL_VOICE_MODELS.iter().map(|m| m.repo_id)
+}
+
+pub(crate) fn allowed_voice_models() -> String {
+    std::iter::once(TRANSCRIPTION_MODEL_OPENAI)
+        .chain(allowed_local_voice_repo_ids())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Options for the voice model picker: (display label, model id, description).
+pub(crate) fn voice_model_picker_options() -> Vec<(&'static str, &'static str, &'static str)> {
+    std::iter::once((
+        "OpenAI",
+        TRANSCRIPTION_MODEL_OPENAI,
+        "Hosted transcription.",
+    ))
+    .chain(
+        ALLOWED_LOCAL_VOICE_MODELS
+            .iter()
+            .map(|m| (m.label, m.repo_id, m.description)),
+    )
+    .collect()
+}
+
+static SELECTED_TRANSCRIPTION_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub(crate) fn selected_transcription_model() -> Option<String> {
+    let guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    guard.clone()
+}
+
+pub(crate) fn try_set_selected_transcription_model(model: impl Into<String>) -> Result<(), String> {
+    let trimmed = model.into().trim().to_string();
+    if trimmed != TRANSCRIPTION_MODEL_OPENAI
+        && !allowed_local_voice_repo_ids().any(|id| id == trimmed)
+    {
+        return Err(format!(
+            "Unsupported voice model '{trimmed}'. Allowed values: {}.",
+            allowed_voice_models()
+        ));
+    }
+    let mut guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard = Some(trimmed);
+    Ok(())
+}
+
+fn resolve_transcription_model_selection() -> Result<String, String> {
+    Ok(selected_transcription_model().unwrap_or_else(|| TRANSCRIPTION_MODEL_OPENAI.to_string()))
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_transcription_model_selection_for_test() -> Result<String, String> {
+    resolve_transcription_model_selection()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_selected_transcription_model_for_test() {
+    let mut guard = SELECTED_TRANSCRIPTION_MODEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("selected transcription model lock poisoned");
+    *guard = None;
+}
 
 struct TranscriptionAuthContext {
     mode: AuthMode,
@@ -56,6 +174,7 @@ pub struct VoiceCapture {
 
 impl VoiceCapture {
     pub fn start() -> Result<Self, String> {
+        resolve_transcription_model_selection().map(|_| ())?;
         let (device, config) = select_default_input_device_and_config()?;
 
         let sample_rate = config.sample_rate().0;
@@ -679,6 +798,40 @@ fn convert_pcm16(
 // Transcription helpers
 // -------------------------
 
+/// Resamples WAV from pipeline rate (24k) to local model rate (16k). No-op if already 16k mono.
+fn resample_wav_for_local_model(wav_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let reader = WavReader::new(Cursor::new(wav_bytes)).map_err(|e| format!("wav: {e}"))?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader
+        .into_samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("wav: {e}"))?;
+    if spec.sample_rate == LOCAL_MODEL_AUDIO_SAMPLE_RATE && spec.channels == 1 {
+        return Ok(wav_bytes.to_vec());
+    }
+    let resampled = convert_pcm16(
+        &samples,
+        spec.sample_rate,
+        spec.channels,
+        LOCAL_MODEL_AUDIO_SAMPLE_RATE,
+        1,
+    );
+    let mut out = Vec::new();
+    let spec_out = WavSpec {
+        channels: 1,
+        sample_rate: LOCAL_MODEL_AUDIO_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(&mut out);
+    let mut writer = WavWriter::new(&mut cursor, spec_out).map_err(|_| "wav".to_string())?;
+    resampled
+        .iter()
+        .try_for_each(|s| writer.write_sample(*s).map_err(|_| "wav".to_string()))?;
+    writer.finalize().map_err(|_| "wav".to_string())?;
+    Ok(out)
+}
+
 fn clip_duration_seconds(audio: &RecordedAudio) -> f32 {
     let total_samples = audio.data.len() as f32;
     let samples_per_second = (audio.sample_rate as f32) * (audio.channels as f32);
@@ -771,7 +924,6 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
         .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
 
     let chatgpt_account_id = auth.get_account_id();
-
     let token = auth
         .get_token()
         .map_err(|e| format!("failed to get auth token: {e}"))?;
@@ -786,7 +938,160 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     })
 }
 
-async fn transcribe_bytes(
+static MODEL_SLOT: OnceLock<Mutex<Option<(String, Box<dyn SpeechModel + Send>)>>> = OnceLock::new();
+
+fn load_model_for_class(
+    class: LocalVoiceModelClass,
+    model_dir: &PathBuf,
+) -> Result<Box<dyn SpeechModel + Send>, String> {
+    match class {
+        LocalVoiceModelClass::Parakeet => ParakeetModel::load(model_dir, &Quantization::Int8)
+            .map_err(|e| {
+                format!(
+                    "failed to load transcription model from {}: {e}",
+                    model_dir.display()
+                )
+            })
+            .map(|m| -> Box<dyn SpeechModel + Send> { Box::new(m) }),
+    }
+}
+
+async fn ensure_model_downloaded(model_id: &str) -> Result<PathBuf, String> {
+    let api =
+        HfHubApi::new().map_err(|e| format!("failed to initialize Hugging Face Hub API: {e}"))?;
+    let repo = api.model(model_id.to_string());
+    let info = repo
+        .info()
+        .await
+        .map_err(|e| format!("failed to load model metadata from Hugging Face: {e}"))?;
+    if info.siblings.is_empty() {
+        return Err("model repository has no files".to_string());
+    }
+
+    debug!(
+        files = info.siblings.len(),
+        repo = model_id,
+        "downloading model files via hf-hub"
+    );
+    let mut sample_downloaded_path: Option<PathBuf> = None;
+    for sibling in info.siblings {
+        let file_name = sibling.rfilename;
+        let downloaded_path = repo
+            .get(&file_name)
+            .await
+            .map_err(|e| format!("failed to download model file {file_name} via hf-hub: {e}"))?;
+        if sample_downloaded_path.is_none() {
+            sample_downloaded_path = Some(downloaded_path);
+        }
+    }
+
+    let sample = sample_downloaded_path
+        .ok_or_else(|| "failed to resolve model cache path: no files downloaded".to_string())?;
+    let model_dir = sample
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "failed to derive model cache directory from {}",
+                sample.display()
+            )
+        })?
+        .to_path_buf();
+
+    debug!(path = %model_dir.display(), "model cache directory resolved");
+    Ok(model_dir)
+}
+
+fn transcribe_file_with_model(
+    model_id: &str,
+    model_dir: &PathBuf,
+    wav_path: &PathBuf,
+) -> Result<transcribe_rs::TranscriptionResult, String> {
+    let mut slot = MODEL_SLOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|e| format!("model slot lock poisoned: {e}"))?;
+    let needs_reload = slot
+        .as_ref()
+        .is_none_or(|(loaded_model_id, _)| loaded_model_id != model_id);
+    if needs_reload {
+        let class = get_class_for_repo(model_id)
+            .ok_or_else(|| format!("unknown local voice model repo: {model_id}"))?;
+        info!(
+            "loading local transcription model from {}",
+            model_dir.display()
+        );
+        let model = load_model_for_class(class, model_dir)?;
+        *slot = Some((model_id.to_string(), model));
+    }
+    let (_, model) = slot
+        .as_mut()
+        .ok_or_else(|| "internal error: model slot is empty".to_string())?;
+    model
+        .transcribe_file(wav_path, &transcribe_rs::TranscribeOptions::default())
+        .map_err(|e| format!("transcription failed: {e}"))
+}
+
+pub(crate) async fn prefetch_selected_transcription_model(model_id: &str) -> Result<(), String> {
+    if model_id == TRANSCRIPTION_MODEL_OPENAI {
+        return Ok(());
+    }
+    let _ = ensure_model_downloaded(model_id).await?;
+    Ok(())
+}
+
+async fn transcribe_bytes_local(wav_bytes: Vec<u8>) -> Result<String, String> {
+    let model_id = resolve_transcription_model_selection()?;
+    if model_id == TRANSCRIPTION_MODEL_OPENAI {
+        return Err("OpenAI transcription is not a local model.".to_string());
+    }
+    let model_dir = ensure_model_downloaded(&model_id).await.map_err(|e| {
+        error!(error = %e, "transcribe_bytes model download failed");
+        e
+    })?;
+
+    tokio::task::spawn_blocking(move || {
+        debug!("transcribe_bytes blocking task started");
+
+        let wav_bytes = resample_wav_for_local_model(&wav_bytes)
+            .map_err(|e| format!("resample for local model: {e}"))?;
+
+        let tmp = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .map_err(|e| format!("failed to create temp file: {e}"))?;
+        let tmp_path = tmp.path().to_path_buf();
+        debug!(path = %tmp_path.display(), "transcribe temp wav path");
+
+        if let Err(e) = std::fs::write(&tmp_path, &wav_bytes) {
+            error!(error = %e, "transcribe_bytes failed temp wav write");
+            return Err(format!("failed to write temp wav: {e}"));
+        }
+
+        debug!("initializing/parsing local transcription model");
+        let result = match transcribe_file_with_model(&model_id, &model_dir, &tmp_path) {
+            Ok(result) => result,
+            Err(e) => {
+                error!(error = %e, "transcribe_bytes transcribe_file failed");
+                return Err(e);
+            }
+        };
+
+        let text = result.text.trim().to_string();
+        debug!(text_len = text.len(), "transcribe_bytes success");
+        Ok(if text.is_empty() {
+            "(no speech detected)".to_string()
+        } else {
+            text
+        })
+    })
+    .await
+    .map_err(|e| {
+        error!(error = %e, "transcribe_bytes join error");
+        format!("transcription task join error: {e}")
+    })?
+}
+
+async fn transcribe_bytes_openai(
     wav_bytes: Vec<u8>,
     context: Option<String>,
     duration_seconds: f32,
@@ -872,13 +1177,88 @@ async fn transcribe_bytes(
     }
 }
 
+async fn transcribe_bytes(
+    wav_bytes: Vec<u8>,
+    context: Option<String>,
+    duration_seconds: f32,
+) -> Result<String, String> {
+    debug!(wav_bytes = wav_bytes.len(), "transcribe_bytes start");
+    if wav_bytes.is_empty() {
+        error!("transcribe_bytes empty audio buffer");
+        return Err("No audio data".into());
+    }
+
+    let model = resolve_transcription_model_selection()?;
+    if model == TRANSCRIPTION_MODEL_OPENAI {
+        debug!("transcribe_bytes route: openai");
+        return transcribe_bytes_openai(wav_bytes, context, duration_seconds).await;
+    }
+
+    debug!(model = %model, "transcribe_bytes route: local");
+    transcribe_bytes_local(wav_bytes).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::RecordedAudio;
+    use super::TRANSCRIPTION_MODEL_OPENAI;
+    use super::clear_selected_transcription_model_for_test;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
+    use super::resolve_transcription_model_selection_for_test;
+    use super::try_set_selected_transcription_model;
+    use super::voice_model_picker_options;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
+
+    /// Happy path: no voice model selected → defaults to OpenAI (transcribe_bytes route: openai).
+    #[test]
+    fn test_recording_with_no_voice_model_selected_uses_openai() {
+        clear_selected_transcription_model_for_test();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, TRANSCRIPTION_MODEL_OPENAI);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "openai");
+    }
+
+    /// Happy path: OpenAI selected → transcribe_bytes route: openai.
+    #[test]
+    fn test_recording_with_openai_selection_uses_openai() {
+        clear_selected_transcription_model_for_test();
+        try_set_selected_transcription_model(TRANSCRIPTION_MODEL_OPENAI).unwrap();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, TRANSCRIPTION_MODEL_OPENAI);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "openai");
+    }
+
+    /// Happy path: Parakeet (ONNX) selected → transcribe_bytes route: local.
+    #[test]
+    fn test_recording_with_parakeet_selection_uses_local_route() {
+        clear_selected_transcription_model_for_test();
+        let parakeet_id = voice_model_picker_options()
+            .into_iter()
+            .find(|(label, _, _)| *label == "Parakeet")
+            .map(|(_, id, _)| id.to_string())
+            .expect("Parakeet option should exist");
+        try_set_selected_transcription_model(&parakeet_id).unwrap();
+        let model = resolve_transcription_model_selection_for_test().unwrap();
+        assert_eq!(model, parakeet_id);
+        let route = if model == TRANSCRIPTION_MODEL_OPENAI {
+            "openai"
+        } else {
+            "local"
+        };
+        assert_eq!(route, "local");
+    }
 
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {

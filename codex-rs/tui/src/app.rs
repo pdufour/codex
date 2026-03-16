@@ -2596,6 +2596,10 @@ impl App {
                     }
                 }
             }
+            AppEvent::ForceTerminalClear => {
+                let _ = tui.terminal.clear();
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ApplyThreadRollback { num_turns } => {
                 if self.apply_non_pending_thread_rollback(num_turns) {
                     tui.frame_requester().schedule_frame();
