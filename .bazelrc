@@ -30,6 +30,11 @@ common --incompatible_strict_action_env
 # Not ideal, but We need to allow dotslash to be found
 common:linux --test_env=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 common:macos --test_env=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+common:macos --action_env=HOME
+common:macos --linkopt=-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks
+common:macos --linkopt=-framework
+common:macos --linkopt=CoreML
+common:macos --linkopt=-L/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin
 
 # Pass through some env vars Windows needs to use powershell?
 common:windows --test_env=PATH
