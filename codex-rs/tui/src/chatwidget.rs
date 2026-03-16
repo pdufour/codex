@@ -4359,6 +4359,10 @@ impl ChatWidget {
                 self.open_model_popup();
             }
             SlashCommand::VoiceModel => {
+                if !crate::voice::voice_input_available() {
+                    self.add_error_message("Voice input is unavailable in this build.".to_string());
+                    return;
+                }
                 self.open_voice_model_popup();
             }
             SlashCommand::Fast => {
@@ -4671,6 +4675,10 @@ impl ChatWidget {
                 }
             }
             SlashCommand::VoiceModel => {
+                if !crate::voice::voice_input_available() {
+                    self.add_error_message("Voice input is unavailable in this build.".to_string());
+                    return;
+                }
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);
                     return;

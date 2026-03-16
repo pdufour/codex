@@ -43,6 +43,11 @@ const LOCAL_MODEL_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 pub(crate) const TRANSCRIPTION_MODEL_OPENAI: &str = "openai";
 
+/// True when this build has voice input support (voice-input feature enabled).
+pub(crate) fn voice_input_available() -> bool {
+    true
+}
+
 /// Architecture class of a local transcription model; selects the loader used for a repo.
 #[derive(Clone, Copy)]
 enum LocalVoiceModelClass {
@@ -884,8 +889,8 @@ fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
     Ok(wav_bytes)
 }
 
-fn normalize_chatgpt_base_url(base_url: &str) -> String {
-    let mut base_url = base_url.to_string();
+fn normalize_chatgpt_base_url(input: &str) -> String {
+    let mut base_url = input.to_string();
     while base_url.ends_with('/') {
         base_url.pop();
     }
@@ -911,7 +916,6 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     let config = Config::load_with_cli_overrides(Vec::new())
         .await
         .map_err(|e| format!("failed to load config: {e}"))?;
-
     Ok(TranscriptionAuthContext {
         mode: auth.api_auth_mode(),
         bearer_token: token,
